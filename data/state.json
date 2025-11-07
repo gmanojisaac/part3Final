@@ -1,35 +1,19 @@
 [
   {
-    "symbol": "NSE:NIFTY25N1125300PE",
-    "underlying": "NIFTY",
-    "state": "IDLE",
-    "prevSavedLTP": 63.7,
-    "buySignalAt": 1762491471766,
-    "reentryDeadline": 1762491839911,
-    "rollingActive": true,
-    "cancelReentryDueToSell": false,
-    "sellArmed": false,
-    "sellArmRefLTP": null,
-    "entryRefLTP": null,
-    "slPoints": 0.5,
-    "orderValue": 3000,
-    "entryIndexInBuyCycle": 0
-  },
-  {
     "symbol": "NSE:NIFTY25N1125500CE",
     "underlying": "NIFTY",
-    "state": "LONG_ACTIVE",
-    "prevSavedLTP": 49,
-    "buySignalAt": 1762491538592,
-    "reentryDeadline": null,
+    "state": "PENDING_ENTRY",
+    "prevSavedLTP": 93.5,
+    "buySignalAt": 1762495382997,
+    "reentryDeadline": 1762495442997,
     "rollingActive": false,
     "cancelReentryDueToSell": false,
     "sellArmed": false,
     "sellArmRefLTP": null,
-    "entryOrderId": "25110700118132",
-    "entryRefLTP": 49,
+    "entryOrderId": "25110700178694",
+    "entryRefLTP": 93.5,
     "slPoints": 0.5,
     "orderValue": 3000,
-    "entryIndexInBuyCycle": 1
+    "entryIndexInBuyCycle": 0
   }
 ]

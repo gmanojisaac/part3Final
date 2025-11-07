@@ -5,24 +5,26 @@ import { TradeStateMachine } from "./stateMachine";
 import { setMachine } from "./machineRegistry";
 import { socketManager } from "./dataSocket";
 
-/**
- * Rebuild machines from disk; if a position exists at broker,
- * set machine state to LONG_ACTIVE, else IDLE. Also seed missing
- * prevSavedLTP / entryRefLTP baselines after restart so logic continues.
- */
 export async function resumeAllMachines() {
-  const persisted = loadAll();
+  // Allow skip via env
+  if ((process.env.FRESH_START || "").trim() === "1") {
+    console.log("[RESUME] Skipped due to FRESH_START=1");
+    return;
+  }
 
-  // Keep a local handle to the live machine instances we rehydrate
+  const persisted = loadAll();
+  if (!persisted.length) {
+    console.log("[RESUME] No machines found in state file. Skipping.");
+    return;
+  }
+
   const local = new Map<string, TradeStateMachine>();
 
-  // 1) Rehydrate from disk and subscribe symbols for ticks
+  // 1) Rehydrate from disk and subscribe symbols
   for (const p of persisted) {
     const m = TradeStateMachine.fromPersisted(p);
     setMachine(p.symbol, m);
     local.set(p.symbol, m);
-
-    // ensure DataSocket is subscribed so ticks keep driving the logic
     try {
       socketManager.subscribe([p.symbol]);
       console.log("Subscribed (resume):", p.symbol);
@@ -31,11 +33,10 @@ export async function resumeAllMachines() {
     }
   }
 
-  // 2) Reconcile with broker positions
+  // 2) Reconcile with broker positions (best-effort)
   try {
-    const pos = await getPositionsV3();
-    // FYERS returns something like: { s:"ok", netPositions:[ { symbol, qty, ...}, ...] }
-    const net = pos?.netPositions || pos?.netPositions || [];
+    const pos = await getPositionsV3(); // normalized { s, netPositions }
+    const net = Array.isArray(pos?.netPositions) ? pos.netPositions : [];
     const liveLong = new Set<string>();
 
     for (const row of net) {
@@ -44,20 +45,13 @@ export async function resumeAllMachines() {
       if (sym && qty > 0) liveLong.add(sym);
     }
 
-    // 3) Flip states and seed missing baselines when we detect a live position
     for (const p of persisted) {
       const sym = p.symbol;
       const m = local.get(sym);
       if (!m) continue;
 
       if (liveLong.has(sym)) {
-        // We have a broker-side long → move to LONG_ACTIVE if not already
-        if (m.getState() !== "LONG_ACTIVE") {
-          m.onEntryFilled(); // set to LONG_ACTIVE path & persist inside
-        }
-
-        // ✅ Seed missing baselines if they weren't persisted previously
-        // These are used by: entry-ref drop exit & rolling re-entry logic
+        if (m.getState() !== "LONG_ACTIVE") m.onEntryFilled();
         const needsPrev = (m as any).prevSavedLTP == null;
         const needsEntryRef = (m as any).entryRefLTP == null;
         if (needsPrev || needsEntryRef) {
@@ -65,21 +59,14 @@ export async function resumeAllMachines() {
             const q = await getQuotesV3([sym]);
             const lp = q?.d?.[0]?.v?.lp;
             if (lp) {
-              if (needsPrev)     (m as any).prevSavedLTP = lp;
-              if (needsEntryRef) (m as any).entryRefLTP  = lp;
+              if (needsPrev) (m as any).prevSavedLTP = lp;
+              if (needsEntryRef) (m as any).entryRefLTP = lp;
               (m as any).persist?.();
-              console.log(
-                `[RESUME] Seeded baselines for ${sym}: prevSavedLTP=${lp}, entryRefLTP=${lp}`
-              );
-            } else {
-              console.warn(`[RESUME] LTP unavailable for ${sym}; baselines not seeded.`);
+              console.log(`[RESUME] Seeded baselines for ${sym}: prevSavedLTP=${lp}, entryRefLTP=${lp}`);
             }
-          } catch (e) {
-            console.warn(`[RESUME] Could not seed baselines for ${sym}:`, e);
-          }
+          } catch {}
         }
       } else {
-        // No live position → ensure flat state
         if (m.getState() !== "IDLE") {
           (m as any).state = "IDLE";
           (m as any).entryOrderId = undefined;
@@ -90,9 +77,6 @@ export async function resumeAllMachines() {
       }
     }
   } catch (e) {
-    console.warn(
-      "resumeAllMachines: positions fetch failed, continuing with disk state only.",
-      e
-    );
+    console.warn("resumeAllMachines: positions fetch failed, continuing with disk state only.", e);
   }
 }

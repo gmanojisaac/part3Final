@@ -2,7 +2,7 @@
 import fs from "fs";
 import path from "path";
 
-const STORE = path.resolve(__dirname, "../data/state.json");
+export const STORE = path.resolve(__dirname, "../data/state.json");
 
 export interface PersistedMachine {
   symbol: string;
@@ -28,10 +28,11 @@ function ensureDir() {
 }
 
 export function loadAll(): PersistedMachine[] {
+  ensureDir();
   try {
-    ensureDir();
     const raw = fs.readFileSync(STORE, "utf8");
-    return JSON.parse(raw || "[]");
+    const out = JSON.parse(raw || "[]");
+    return Array.isArray(out) ? out : [];
   } catch {
     return [];
   }
@@ -44,12 +45,25 @@ export function saveAll(list: PersistedMachine[]) {
 
 export function upsert(one: PersistedMachine) {
   const all = loadAll();
-  const i = all.findIndex(x => x.symbol === one.symbol);
-  if (i >= 0) all[i] = one; else all.push(one);
+  const i = all.findIndex((x) => x.symbol === one.symbol);
+  if (i >= 0) all[i] = one;
+  else all.push(one);
   saveAll(all);
 }
 
 export function remove(symbol: string) {
-  const all = loadAll().filter(x => x.symbol !== symbol);
+  const all = loadAll().filter((x) => x.symbol !== symbol);
   saveAll(all);
+}
+
+export function wipeStore() {
+  const dir = path.dirname(STORE);
+  try {
+    if (fs.existsSync(STORE)) fs.unlinkSync(STORE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(STORE, "[]");
+    console.log("[RESET] Cleared state file:", STORE);
+  } catch (e) {
+    console.warn("[RESET] Failed to clear state file:", STORE, e);
+  }
 }
