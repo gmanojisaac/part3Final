@@ -1,0 +1,17 @@
+Alert ID,Ticker,Name,Description,Time
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.00 | stopPx=48.95 | sym=NIFTY251111C25700,2025-11-06T09:52:00Z
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.00 | stopPx=50.15 | sym=NIFTY251111C25700,2025-11-06T08:36:00Z
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.00 | stopPx=51.40 | sym=NIFTY251111C25700,2025-11-06T08:30:01Z
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.00 | stopPx=51.25 | sym=NIFTY251111C25700,2025-11-06T08:26:01Z
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.00 | stopPx=59.55 | sym=NIFTY251111C25700,2025-11-06T06:06:01Z
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.00 | stopPx=62.20 | sym=NIFTY251111C25700,2025-11-06T05:56:01Z
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.05 | stopPx=63.50 | sym=NIFTY251111C25700,2025-11-06T05:13:01Z
+3304253287,"NSE:NIFTY251111P25550, 1m","Green (0, Open): Any alert() function call",Accepted Exit + priorRisePct= 0.05 | stopPx=119.15 | sym=NIFTY251111P25550,2025-11-06T05:09:00Z
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.00 | stopPx=65.50 | sym=NIFTY251111C25700,2025-11-06T05:07:01Z
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.00 | stopPx=71.15 | sym=NIFTY251111C25700,2025-11-06T04:48:00Z
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.00 | stopPx=104.25 | sym=NIFTY251111C25700,2025-11-06T04:18:01Z
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.00 | stopPx=108.45 | sym=NIFTY251111C25700,2025-11-06T04:01:01Z
+3304252864,"NSE:NIFTY251111P25550, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.05 | stopPx=63.15 | sym=NIFTY251111P25550,2025-11-06T03:52:01Z
+3304251701,"NSE:NIFTY251111C25700, 1m","Green (0, Open): Any alert() function call",Accepted Exit + priorRisePct= 0.00 | stopPx=138.65 | sym=NIFTY251111C25700,2025-11-06T03:52:00Z
+3304253287,"NSE:NIFTY251111P25550, 1m","Green (0, Open): Any alert() function call",Accepted Exit + priorRisePct= 0.05 | stopPx=108.00 | sym=NIFTY251111P25550,2025-11-06T03:46:01Z
+3304251321,"NSE:NIFTY251111C25700, 1m","Red (0.01, Close): Any alert() function call",Accepted Entry + priorFallPct= 0.00 | stopPx=127.50 | sym=NIFTY251111C25700,2025-11-06T03:46:00Z

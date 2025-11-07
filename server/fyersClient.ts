@@ -22,6 +22,39 @@ export async function getQuotesV3(symbols: string[]) {
   return fyers.getQuotes(symbols);
 }
 
+/**
+ * Positions wrapper that is compatible across SDK variants.
+ * Tries get_positions() first (preferred), then positions(), then positionsV2() if present.
+ * Returns a normalized shape: { s, netPositions: [...] }
+ */
+export async function getPositionsV3(): Promise<{ s: string; netPositions: any[] }> {
+  let raw: any;
+
+  // Prefer get_positions() if available
+  if (typeof fyers.get_positions === "function") {
+    raw = await fyers.get_positions();
+  } else if (typeof fyers.positions === "function") {
+    raw = await fyers.positions();
+  } else if (typeof fyers.positionsV2 === "function") {
+    raw = await fyers.positionsV2();
+  } else {
+    throw new Error(
+      "FYERS SDK: no positions function found (expected get_positions / positions / positionsV2)."
+    );
+  }
+
+  // Normalize common variants
+  const netPositions =
+    raw?.netPositions ??
+    raw?.net_positions ??
+    raw?.data?.netPositions ??
+    raw?.data?.net_positions ??
+    raw?.data ??
+    [];
+
+  return { s: raw?.s ?? "ok", netPositions: Array.isArray(netPositions) ? netPositions : [] };
+}
+
 // ---------- HELPERS ----------
 const toSideNum = (side: "BUY" | "SELL") => (side === "BUY" ? 1 : -1);
 
@@ -37,37 +70,10 @@ function validateLimit(payload: { limitPrice: number }) {
 type Product = "INTRADAY" | "CNC" | "NRML";
 type Validity = "DAY" | "IOC";
 
-export type OrderStatusRow = {
-  id?: string;
-  status?: string; // PENDING/OPEN/REJECTED/TRADED/FILLED/...
-  symbol?: string;
-  side?: number;
-  qty?: number;
-  limitPrice?: number;
-};
-
-export type CancelResult =
-  | { ok: true; raw: any }
-  | { notPending: true; raw: any }
-  | { error: true; raw: any };
-
-// Type guards (so TS can narrow cleanly)
-export function isCancelOk(r: CancelResult | undefined): r is { ok: true; raw: any } {
-  return !!r && (r as any).ok === true;
-}
-export function isCancelNotPending(
-  r: CancelResult | undefined
-): r is { notPending: true; raw: any } {
-  return !!r && (r as any).notPending === true;
-}
-export function isCancelError(r: CancelResult | undefined): r is { error: true; raw: any } {
-  return !!r && (r as any).error === true;
-}
-
 // ---------- ORDERS ----------
-
 /**
  * Place a LIMIT order (type=1). limitPrice is sanitized & validated.
+ * Prints a timestamped [FYERS place_order][LIMIT] payload in IST.
  */
 export async function placeLimitOrderV3(params: {
   symbol: string;
@@ -77,7 +83,7 @@ export async function placeLimitOrderV3(params: {
   productType?: Product;
   validity?: Validity;
 }) {
-  const limit = atLeastOneTick(params.limitPrice);
+  const limit = atLeastOneTick(params.limitPrice); // sanitize + non-zero
   const payload = {
     symbol: params.symbol,
     qty: params.qty,
@@ -93,72 +99,46 @@ export async function placeLimitOrderV3(params: {
 
   validateLimit(payload);
 
-  console.log(`[${nowIST()}] [FYERS place_order][LIMIT] payload: ${JSON.stringify(payload)}`);
+  // Timestamped debug line in IST
+  console.log(
+    `[${nowIST()}] [FYERS place_order][LIMIT] payload: ${JSON.stringify(payload)}`
+  );
 
   const res = await fyers.place_order(payload);
   if (res?.s !== "ok") {
     console.error(`[${nowIST()}] [FYERS place_order][LIMIT] error:`, res);
     throw new Error(`place_limit failed: ${JSON.stringify(res)}`);
   }
-  return res;
+  return res; // { id: "...", ... }
 }
 
 /**
- * Cancel an order by id. Returns a discriminated union.
+ * Cancel an order by id. Ignores -52 "Not a pending order" (already filled/cancelled).
+ * Prints timestamped cancel attempts.
  */
-export async function cancelOrderV3(orderId?: string): Promise<CancelResult | undefined> {
+export async function cancelOrderV3(orderId?: string) {
   if (!orderId) return;
   try {
     console.log(`[${nowIST()}] [FYERS cancel_order] id=${orderId}`);
     const res = await fyers.cancel_order({ id: orderId });
-    if (res?.s === "ok") return { ok: true, raw: res };
-
-    if (res?.code === -52) {
-      console.log(
-        `[${nowIST()}] [FYERS cancel_order] ignored (-52): already not pending (${orderId})`
-      );
-      return { notPending: true, raw: res };
+    if (res?.s !== "ok") {
+      if (res?.code === -52) {
+        console.log(
+          `[${nowIST()}] [FYERS cancel_order] ignored (-52): already not pending (${orderId})`
+        );
+        return res;
+      }
+      console.warn(`[${nowIST()}] [FYERS cancel_order] response:`, res);
     }
-
-    console.warn(`[${nowIST()}] [FYERS cancel_order] response:`, res);
-    return { error: true, raw: res };
+    return res;
   } catch (e: any) {
     const txt = e?.message || String(e);
     if (txt.includes("Not a pending order") || txt.includes('"code":-52')) {
       console.log(
         `[${nowIST()}] [FYERS cancel_order] ignored (-52): already not pending (${orderId})`
       );
-      return { notPending: true, raw: e };
+      return;
     }
     console.error(`[${nowIST()}] [FYERS cancel_order] error:`, e);
-    return { error: true, raw: e };
   }
-}
-
-/**
- * Try to read the orderbook and find an order by id.
- * NOTE: SDK method names vary; this tries orderbook()/orders() if present.
- */
-export async function getOrderStatus(orderId: string): Promise<OrderStatusRow | undefined> {
-  try {
-    if (typeof fyers.orderbook === "function") {
-      const ob = await fyers.orderbook();
-      const list: any[] = ob?.orderBook || ob?.orders || [];
-      return list.find((o) => o?.id === orderId);
-    }
-  } catch {
-    console.log(`[${nowIST()}] [FYERS getOrderStatus] orderbook() not available / failed`);
-  }
-
-  try {
-    if (typeof fyers.orders === "function") {
-      const ob2 = await fyers.orders();
-      const list2: any[] = ob2?.orderBook || ob2?.orders || [];
-      return list2.find((o) => o?.id === orderId);
-    }
-  } catch {
-    console.log(`[${nowIST()}] [FYERS getOrderStatus] orders() not available / failed`);
-  }
-
-  return undefined;
 }
