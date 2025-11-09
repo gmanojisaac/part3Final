@@ -2,68 +2,55 @@
 import fs from "fs";
 import path from "path";
 
-export const STORE = path.resolve(__dirname, "../data/state.json");
+const DATA_DIR = path.resolve(__dirname, "../data");
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-export interface PersistedMachine {
+const FILE = path.join(DATA_DIR, "machines.json");
+
+export type PersistedMachine = {
   symbol: string;
   underlying: string;
-  state: "IDLE" | "PENDING_ENTRY" | "LONG_ACTIVE";
-  prevSavedLTP: number | null;
-  buySignalAt: number | null;
-  reentryDeadline: number | null;
-  rollingActive: boolean;
-  cancelReentryDueToSell: boolean;
-  sellArmed: boolean;
-  sellArmRefLTP: number | null;
+  state: string;
+  prevSavedLTP?: number | null;
+  buySignalAt?: number | null;
+  reentryDeadline?: number | null;
+  rollingActive?: boolean;
+  cancelReentryDueToSell?: boolean;
+  sellArmed?: boolean;
+  sellArmRefLTP?: number | null;
   entryOrderId?: string;
-  entryRefLTP: number | null;
-  slPoints: number;
-  orderValue: number;
-}
+  entryRefLTP?: number | null;
+  slPoints?: number;
+  orderValue?: number;
+};
 
-function ensureDir() {
-  const dir = path.dirname(STORE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  if (!fs.existsSync(STORE)) fs.writeFileSync(STORE, "[]");
-}
+type FileShape = Record<string, any>;
 
-export function loadAll(): PersistedMachine[] {
-  ensureDir();
+function read(): FileShape {
   try {
-    const raw = fs.readFileSync(STORE, "utf8");
-    const out = JSON.parse(raw || "[]");
-    return Array.isArray(out) ? out : [];
+    if (!fs.existsSync(FILE)) return {};
+    const raw = fs.readFileSync(FILE, "utf8");
+    return raw ? JSON.parse(raw) : {};
   } catch {
-    return [];
+    return {};
   }
 }
 
-export function saveAll(list: PersistedMachine[]) {
-  ensureDir();
-  fs.writeFileSync(STORE, JSON.stringify(list, null, 2));
+function write(obj: FileShape) {
+  fs.writeFileSync(FILE, JSON.stringify(obj, null, 2));
 }
 
-export function upsert(one: PersistedMachine) {
-  const all = loadAll();
-  const i = all.findIndex((x) => x.symbol === one.symbol);
-  if (i >= 0) all[i] = one;
-  else all.push(one);
-  saveAll(all);
+export function upsert(m: any) {
+  const db = read();
+  db[m.symbol] = m;
+  write(db);
 }
 
-export function remove(symbol: string) {
-  const all = loadAll().filter((x) => x.symbol !== symbol);
-  saveAll(all);
+export function loadAll(): any[] {
+  const db = read();
+  return Object.values(db) as any[];
 }
 
-export function wipeStore() {
-  const dir = path.dirname(STORE);
-  try {
-    if (fs.existsSync(STORE)) fs.unlinkSync(STORE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(STORE, "[]");
-    console.log("[RESET] Cleared state file:", STORE);
-  } catch (e) {
-    console.warn("[RESET] Failed to clear state file:", STORE, e);
-  }
+export function clearAll() {
+  write({});
 }

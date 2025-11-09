@@ -1,121 +1,82 @@
 // server/dataSocket.ts
-import path from "path";
-import fs from "fs";
-import dotenv from "dotenv";
-dotenv.config();
+import EventEmitter from "events";
+import { onTickFromMarket } from "./fyersClient";
 
-// FYERS data socket
-const { fyersDataSocket: DataSocket } = require("fyers-api-v3");
+/**
+ * Tick shape normalized for the app
+ */
+export type Tick = {
+  symbol: string;
+  ltp: number;
+  ts: number; // epoch ms
+};
 
-function buildAccessTokenString() {
-  // SDK expects "APPID:ACCESS_TOKEN"
-  const appId = process.env.FYERS_APP_ID || "";
-  const token = process.env.FYERS_ACCESS_TOKEN || "";
-  return `${appId}:${token}`;
-}
+type TickListener = (symbol: string, ltp: number, ts: number) => void;
 
-class SocketManager {
-  private skt: any | null = null;
+/**
+ * DataSocket:
+ * - Owns the broker WS connection (implement your actual FYERS WS here)
+ * - Emits normalized ticks to listeners
+ * - Always forwards ticks to paper broker (if PAPERTRADE=true)
+ */
+class DataSocket extends EventEmitter {
+  private subscriptions = new Map<string, number>(); // symbol -> refcount
   private connected = false;
-  private subs = new Set<string>();
-  private logDir = path.resolve(__dirname, "../fyers_logs");
 
-  start() {
-    if (!fs.existsSync(this.logDir)) fs.mkdirSync(this.logDir, { recursive: true });
-    const access = buildAccessTokenString();
+  /** Connect to broker feed (idempotent) */
+  async connect(): Promise<void> {
+    if (this.connected) return;
+    // TODO: wire your actual FYERS WS client here and call this.handleIncomingTick(...)
+    // For example:
+    // this.brokerWs.on("tick", (raw) => this.handleIncomingTick(normalize(raw)));
+    this.connected = true;
+  }
 
-    this.skt = DataSocket.getInstance(access, this.logDir);
+  /** Subscribe to a symbol; returns an unsubscribe function */
+  async subscribe(symbol: string, listener?: TickListener): Promise<() => void> {
+    await this.connect();
+    const count = this.subscriptions.get(symbol) ?? 0;
+    this.subscriptions.set(symbol, count + 1);
+    if (listener) {
+      this.on("tick", (sym, ltp, ts) => {
+        if (sym === symbol) listener(sym, ltp, ts);
+      });
+    }
+    // TODO: if count was 0 -> send subscribe request to FYERS WS for this symbol
+    return () => this.unsubscribe(symbol, listener);
+  }
 
-    this.skt.on("connect", () => {
-      this.connected = true;
-      console.log("✅ DataSocket connected");
-      // Re-subscribe whatever we have in memory
-      const arr = Array.from(this.subs);
-      if (arr.length) {
-        try {
-          this.skt.subscribe(arr);
-          console.log("Subscribed (flush):", arr);
-        } catch (e) {
-          console.warn("subscribe on connect failed:", e);
-        }
-      }
-    });
-
-    this.skt.on("message", (_msg: any) => {
-      // You already wire ticks elsewhere to machines.onTick(...)
-      // Keep this if you want to debug raw ticks
-      // console.log({ tick: _msg });
-    });
-
-    this.skt.on("error", (err: any) => {
-      console.warn("DataSocket error:", err);
-    });
-
-    this.skt.on("close", () => {
-      this.connected = false;
-      console.log("DataSocket closed");
-    });
-
-    try {
-      this.skt.connect();
-      this.skt.autoreconnect();
-    } catch (e) {
-      console.warn("DataSocket start connect failed:", e);
+  /** Unsubscribe; will unref WS symbol when refcount hits 0 */
+  unsubscribe(symbol: string, listener?: TickListener) {
+    if (listener) {
+      // remove specific bound listener (EventEmitter doesn't support predicate removal easily)
+      // Consumers that pass listener should keep their own off() if needed; we keep it simple here.
+    }
+    const count = this.subscriptions.get(symbol) ?? 0;
+    const next = Math.max(0, count - 1);
+    if (next === 0) {
+      this.subscriptions.delete(symbol);
+      // TODO: send unsubscribe request to FYERS WS for this symbol
+    } else {
+      this.subscriptions.set(symbol, next);
     }
   }
 
-  /** Subscribe adds and pushes to socket if connected */
-  subscribe(symbols: string[]) {
-    const list = symbols.filter(Boolean);
-    let toSend: string[] = [];
-    for (const s of list) {
-      if (!this.subs.has(s)) {
-        this.subs.add(s);
-        toSend.push(s);
-      }
-    }
-    if (this.connected && toSend.length) {
-      try {
-        this.skt.subscribe(toSend);
-        console.log("Subscribed:", toSend);
-      } catch (e) {
-        console.warn("subscribe failed:", e);
-      }
-    }
+  /** Central place to dispatch ticks to the app + paper broker */
+  private handleIncomingTick(t: Tick) {
+    // Fanout to listeners
+    this.emit("tick", t.symbol, t.ltp, t.ts);
+
+    // Always feed paper broker to simulate order fills/P&L in paper mode.
+    onTickFromMarket(t.symbol, t.ltp);
   }
 
-  /** Unsubscribe all currently tracked symbols (and clear memory) */
-  unsubscribeAll() {
-    const arr = Array.from(this.subs);
-    if (this.connected && arr.length) {
-      try {
-        this.skt.unsubscribe(arr);
-        console.log("Unsubscribed all:", arr);
-      } catch (e) {
-        console.warn("unsubscribeAll failed:", e);
-      }
-    }
-    this.subs.clear();
-  }
-
-  /** Flush to a given set (replace any old subs) */
-  flush(newList: string[] = []) {
-    this.unsubscribeAll();
-    // Replace with new list and subscribe
-    for (const s of newList) this.subs.add(s);
-    if (this.connected && newList.length) {
-      try {
-        this.skt.subscribe(newList);
-        console.log("Subscribed (flush):", newList);
-      } catch (e) {
-        console.warn("flush subscribe failed:", e);
-      }
-    }
-  }
-
-  currentList(): string[] {
-    return Array.from(this.subs);
+  /* -----------------------------------------------------------------------
+   * Public helper if you want to inject ticks (useful for tests)
+   * ---------------------------------------------------------------------*/
+  injectTick(symbol: string, ltp: number, ts: number = Date.now()) {
+    this.handleIncomingTick({ symbol, ltp, ts });
   }
 }
 
-export const socketManager = new SocketManager();
+export const dataSocket = new DataSocket();

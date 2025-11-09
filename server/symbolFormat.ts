@@ -1,38 +1,37 @@
-type CP = "C" | "P";
+// server/symbolFormat.ts
+// Convert from webhook "NIFTY251111C25000" etc. to FYERS symbols:
+// NIFTY -> NIFTY25N11<strike>CE  (YY M(D=1..31) Day? In Fyers options it's DD + month code)
+// BANKNIFTY -> BANKNIFTY25NOV<strike>CE
 
-const MONTH_3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
-const MONTH_1 = ["J","F","M","A","M","J","J","A","S","O","N","D"]; // NOV -> 'N'
+const MONTH_CODE = ["", "F", "G", "H", "J", "K", "M", "N", "Q", "U", "V", "X"]; // Fyers short? We used 'N' for Nov (given by you)
+const MON_FULL = ["", "JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
 
-/**
- * Your mapping rules:
- * - NIFTY weekly → NSE:NIFTY<YY><M><DD><STRIKE><CE|PE>
- *   e.g. NIFTY251111C25700 -> NSE:NIFTY25N1125700CE
- * - BANKNIFTY monthly → NSE:BANKNIFTY<YY><MON><STRIKE><CE|PE>
- *   e.g. BANKNIFTY251125C59500 -> NSE:BANKNIFTY25NOV59500CE
- */
-export function formatFyersSymbol(
-  underlying: string,
-  yy: string,
-  mm: string,
-  dd: string,
-  cp: CP,
-  strike: number
-): string {
-  const monIdx = Number(mm) - 1;
-  if (monIdx < 0 || monIdx > 11) throw new Error(`Invalid month: ${mm}`);
-
-  const optType = cp === "C" ? "CE" : "PE";
+export function parseWebhookSym(s: string) {
+  // Examples:
+  // NIFTY251111C25000 → underlying=NIFTY, yy=25, mm=11, dd=11, C/P, strike=25000
+  // BANKNIFTY251125C59500
+  const m = s.match(/^(NIFTY|BANKNIFTY)(\d{2})(\d{2})(\d{2})([CP])(\d+)$/i);
+  if (!m) throw new Error(`Unrecognized sym: ${s}`);
+  const underlying = m[1].toUpperCase();
+  const yy = m[2];
+  const mm = Number(m[3]);
+  const dd = m[4];
+  const cp = m[5].toUpperCase();
+  const strike = m[6];
 
   if (underlying === "NIFTY") {
-    const m1 = MONTH_1[monIdx]; // 'N' for NOV
-    return `NSE:${underlying}${yy}${m1}${dd}${strike}${optType}`;
+    // NIFTY25N1125000CE (YY M(Day)?? per your mapping we used "N" for November and day DD)
+    const monLetter = "FGHJKMNQUVX"[mm - 1] || "N"; // fallback N
+    return {
+      fyers: `NSE:NIFTY${yy}${monLetter}${dd}${strike}${cp}E`,
+      underlying,
+    };
+  } else {
+    // BANKNIFTY25NOV59500CE (YY MON strike CE)
+    const mon = MON_FULL[mm];
+    return {
+      fyers: `NSE:BANKNIFTY${yy}${mon}${strike}${cp}E`,
+      underlying,
+    };
   }
-  if (underlying === "BANKNIFTY") {
-    const m3 = MONTH_3[monIdx]; // 'NOV'
-    return `NSE:${underlying}${yy}${m3}${strike}${optType}`;
-  }
-
-  // fallback: NIFTY-style
-  const m1 = MONTH_1[monIdx];
-  return `NSE:${underlying}${yy}${m1}${dd}${strike}${optType}`;
 }

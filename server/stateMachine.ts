@@ -12,17 +12,18 @@ import { upsert, PersistedMachine } from "./stateStore";
 
 type State = "IDLE" | "PENDING_ENTRY" | "LONG_ACTIVE";
 type Signal = "BUY_SIGNAL" | "SELL_SIGNAL";
+type WindowDir = "BUY" | "SELL" | null;
 
 export interface MachineConfig {
-  symbol: string;           // e.g. "NSE:NIFTY25N1125700CE"
+  symbol: string;           // "NSE:NIFTY25N1125700CE"
   underlying: string;       // "NIFTY" | "BANKNIFTY"
-  slPoints?: number;        // 0.5 for first entry of a cycle
-  orderValue?: number;      // default ₹1L
+  slPoints?: number;        // 0.5
+  orderValue?: number;      // ₹1L
 }
 
 const ENTRY_TTL_MS = Number(process.env.ENTRY_TTL_MS ?? 15000);
-const ENTRY_OFFSET  = Number(process.env.ENTRY_OFFSET  ?? 0.5);
-const EXIT_OFFSET   = Number(process.env.EXIT_OFFSET   ?? 0.5);
+const ENTRY_OFFSET  = Number(process.env.ENTRY_OFFSET  ?? 0.5); // Buy @ LTP+0.5
+const EXIT_OFFSET   = Number(process.env.EXIT_OFFSET   ?? 0.5); // Sell @ LTP-0.5
 
 export class TradeStateMachine {
   private readonly symbol: string;
@@ -31,33 +32,31 @@ export class TradeStateMachine {
   private readonly orderValue: number;
 
   private state: State = "IDLE";
+  private entryOrderId?: string;
 
-  private prevSavedLTP: number | null = null;
-  private buySignalAt: number | null = null;
-  private reentryDeadline: number | null = null;
+  private savedBUYLTP: number | null = null;
+  private savedSELLLTP: number | null = null;
+  private entryRefLTP: number | null = null;
+
+  private sellStartBuyAnchor: number | null = null;
+  private pendingBuyAfterSell: boolean = false;
+  private pendingBuyAnchor: number | null = null;
+
+  private windowDir: WindowDir = null;
+  private windowEndsAt: number | null = null;
+  private windowExited: boolean = false;
+  private buyWindowSilenced: boolean = false;
+  private buyEntriesFilledThisWindow: number = 0;
+  private buyWindowIndexSinceLastSell: number = 0;
+
+  private exiting = false;
   private reentryTimer: NodeJS.Timeout | null = null;
 
-  private rollingActive = false;
-  private cancelReentryDueToSell = false;
-
-  private sellArmed = false;
-  private sellArmRefLTP: number | null = null;
-
-  private entryOrderId?: string;
-  private entryRefLTP: number | null = null;
-  private exiting = false;
-
-  // per-BUY-cycle index: 1 = first fill; 2+ = subsequent fills
-  private entryIndexInBuyCycle = 0;
-
-  // NEW: once a loss exit happens during the 60s window, block further entries until window end
-  private noReentryThisWindow = false;
-
   constructor(cfg: MachineConfig) {
-    this.symbol      = cfg.symbol;
-    this.underlying  = cfg.underlying.toUpperCase();
-    this.slPoints    = cfg.slPoints ?? 0.5;
-    this.orderValue  = cfg.orderValue ?? 100000;
+    this.symbol = cfg.symbol;
+    this.underlying = cfg.underlying.toUpperCase();
+    this.slPoints = cfg.slPoints ?? 0.5;
+    this.orderValue = cfg.orderValue ?? 100000;
     this.log(`[INIT] StateMachine created`);
     this.persist();
   }
@@ -65,34 +64,38 @@ export class TradeStateMachine {
   private log(msg: string) { console.log(`[${nowIST()}] [${this.symbol}] ${msg}`); }
 
   private persist() {
-    const p: PersistedMachine & {
-      entryIndexInBuyCycle?: number;
-      noReentryThisWindow?: boolean;
-    } = {
+    const p: PersistedMachine & any = {
       symbol: this.symbol,
       underlying: this.underlying,
       state: this.state,
-      prevSavedLTP: this.prevSavedLTP,
-      buySignalAt: this.buySignalAt,
-      reentryDeadline: this.reentryDeadline,
-      rollingActive: this.rollingActive,
-      cancelReentryDueToSell: this.cancelReentryDueToSell,
-      sellArmed: this.sellArmed,
-      sellArmRefLTP: this.sellArmRefLTP,
+      prevSavedLTP: null,
+      buySignalAt: null,
+      reentryDeadline: this.windowEndsAt,
+      rollingActive: false,
+      cancelReentryDueToSell: false,
+      sellArmed: false,
+      sellArmRefLTP: null,
       entryOrderId: this.entryOrderId,
       entryRefLTP: this.entryRefLTP,
       slPoints: this.slPoints,
       orderValue: this.orderValue,
-      entryIndexInBuyCycle: this.entryIndexInBuyCycle,
-      noReentryThisWindow: this.noReentryThisWindow,
+
+      savedBUYLTP: this.savedBUYLTP,
+      savedSELLLTP: this.savedSELLLTP,
+      windowDir: this.windowDir,
+      windowEndsAt: this.windowEndsAt,
+      windowExited: this.windowExited,
+      buyEntriesFilledThisWindow: this.buyEntriesFilledThisWindow,
+      buyWindowSilenced: this.buyWindowSilenced,
+      sellStartBuyAnchor: this.sellStartBuyAnchor,
+      pendingBuyAfterSell: this.pendingBuyAfterSell,
+      pendingBuyAnchor: this.pendingBuyAnchor,
+      buyWindowIndexSinceLastSell: this.buyWindowIndexSinceLastSell,
     };
     upsert(p);
   }
 
-  public static fromPersisted(p: PersistedMachine & {
-    entryIndexInBuyCycle?: number;
-    noReentryThisWindow?: boolean;
-  }) {
+  public static fromPersisted(p: PersistedMachine & any) {
     const m = new TradeStateMachine({
       symbol: p.symbol,
       underlying: p.underlying,
@@ -100,18 +103,24 @@ export class TradeStateMachine {
       orderValue: p.orderValue,
     });
     (m as any).state = p.state;
-    (m as any).prevSavedLTP = p.prevSavedLTP;
-    (m as any).buySignalAt = p.buySignalAt;
-    (m as any).reentryDeadline = p.reentryDeadline;
-    (m as any).rollingActive = (p as any).rollingActive;
-    (m as any).cancelReentryDueToSell = p.cancelReentryDueToSell;
-    (m as any).sellArmed = p.sellArmed;
-    (m as any).sellArmRefLTP = p.sellArmRefLTP;
     (m as any).entryOrderId = p.entryOrderId;
     (m as any).entryRefLTP = p.entryRefLTP;
-    (m as any).entryIndexInBuyCycle = p.entryIndexInBuyCycle ?? 0;
-    (m as any).noReentryThisWindow = p.noReentryThisWindow ?? false;
-    m.log(`[RESUME] rehydrated from disk with state=${p.state}, idx=${(m as any).entryIndexInBuyCycle}, windowBlock=${(m as any).noReentryThisWindow}`);
+
+    (m as any).savedBUYLTP = p.savedBUYLTP ?? null;
+    (m as any).savedSELLLTP = p.savedSELLLTP ?? null;
+
+    (m as any).windowDir = p.windowDir ?? null;
+    (m as any).windowEndsAt = p.windowEndsAt ?? null;
+    (m as any).windowExited = p.windowExited ?? false;
+    (m as any).buyEntriesFilledThisWindow = p.buyEntriesFilledThisWindow ?? 0;
+    (m as any).buyWindowSilenced = p.buyWindowSilenced ?? false;
+
+    (m as any).sellStartBuyAnchor = p.sellStartBuyAnchor ?? null;
+    (m as any).pendingBuyAfterSell = p.pendingBuyAfterSell ?? false;
+    (m as any).pendingBuyAnchor = p.pendingBuyAnchor ?? null;
+    (m as any).buyWindowIndexSinceLastSell = p.buyWindowIndexSinceLastSell ?? 0;
+
+    m.log(`[RESUME] state=${p.state}, window=${(m as any).windowDir ?? "NONE"} exitsUsed=${(m as any).windowExited ? 1 : 0}, buyIdx=${(m as any).buyWindowIndexSinceLastSell}`);
     m.persist();
     return m;
   }
@@ -121,133 +130,123 @@ export class TradeStateMachine {
   async onSignal(sig: Signal, ltpHint?: number) {
     const ltp = await this.ensureLTP(ltpHint);
     this.log(`Signal: ${sig} @ LTP=${ltp.toFixed(2)} | state=${this.state}`);
-    if (sig === "BUY_SIGNAL")  return this.onBuySignal(ltp);
+    if (sig === "BUY_SIGNAL") return this.onBuySignal(ltp);
     if (sig === "SELL_SIGNAL") return this.onSellSignal(ltp);
   }
 
   async onTick(ltp: number) {
-    // Loss-exit rules (first vs subsequent entries under same BUY cycle)
-    if (!this.exiting && this.state === "LONG_ACTIVE") {
-      let shouldExit = false;
-      let thresholdDesc = "";
-      let thresholdVal = 0;
+    // BUY window logic (with subsequent window silencing rule)
+    if (this.windowDir === "BUY" && this.isWindowActive()) {
+      if (this.buyWindowSilenced) return;
 
-      if (this.entryIndexInBuyCycle <= 1) {
-        if (this.entryRefLTP != null) {
-          const thresh = this.entryRefLTP - this.slPoints;
-          if (ltp <= thresh) { shouldExit = true; thresholdDesc = `entryRefLTP - ${this.slPoints}`; thresholdVal = thresh; }
-        }
-      } else {
-        if (this.prevSavedLTP != null) {
-          if (ltp < this.prevSavedLTP) { shouldExit = true; thresholdDesc = "prevSavedLTP"; thresholdVal = this.prevSavedLTP; }
-        }
-      }
-
-      if (shouldExit) {
-        this.exiting = true;
-        this.log(`[LOSS EXIT] idx=${this.entryIndexInBuyCycle} ltp=${ltp.toFixed(2)} <= ${thresholdDesc}(${thresholdVal.toFixed(2)}) ⇒ exit @ (ltp-0.5)`);
-        await this.exitLong("LOSS_EXIT", ltp);
-
-        // NEW: if inside the 60s window, block any further entries until window end
-        if (this.withinWindow()) {
-          this.noReentryThisWindow = true;
-          this.log(`[WINDOW BLOCK] Loss exit during 60s window → block re-entries until window ends`);
-        }
-
-        this.exiting = false;
-        this.persist();
-        return;
-      }
-    }
-
-    // SELL-armed drop exit while long (unchanged)
-    if (this.state === "LONG_ACTIVE" && this.sellArmed && this.sellArmRefLTP != null) {
-      if (ltp <= this.sellArmRefLTP - this.slPoints) {
-        if (!this.exiting) {
+      if (!this.exiting && !this.windowExited && this.state === "LONG_ACTIVE") {
+        const firstEntry = this.buyEntriesFilledThisWindow <= 1;
+        const stopThresh = firstEntry ? (this.savedBUYLTP! - this.slPoints) : (this.savedBUYLTP!);
+        if (ltp <= stopThresh) {
           this.exiting = true;
-          this.log(`[SELL-ARM DROP EXIT] ltp=${ltp.toFixed(2)} <= ${(this.sellArmRefLTP - this.slPoints).toFixed(2)}`);
-          await this.exitLong("SELL_ARM_DROP_EXIT", ltp);
-
-          if (this.withinWindow()) {
-            this.noReentryThisWindow = true;
-            this.log(`[WINDOW BLOCK] Sell-armed loss exit during 60s window → block re-entries until window ends`);
-          }
-
+          this.log(`[BUY-WINDOW STOP] ltp=${ltp.toFixed(2)} <= ${stopThresh.toFixed(2)} → exit & consume window`);
+          await this.exitLong("BUY_WINDOW_STOP", ltp);
+          this.windowExited = true;
           this.exiting = false;
           this.persist();
+          return;
+        }
+      }
+
+      if (!this.windowExited && this.state === "IDLE") {
+        if (ltp > (this.savedBUYLTP ?? Number.POSITIVE_INFINITY - 1)) {
+          await this.enterLong(ltp);
+        }
+      }
+
+      // Subsequent BUY windows (after first SELL): silence if price < sellStartBuyAnchor
+      if (this.buyWindowIndexSinceLastSell >= 2 && this.sellStartBuyAnchor != null) {
+        if (ltp < this.sellStartBuyAnchor) {
+          this.savedBUYLTP = this.sellStartBuyAnchor;
+          this.pendingBuyAfterSell = false;
+          this.buyWindowSilenced = true;
+          this.log(`[BUY WINDOW SILENCE] ltp ${ltp.toFixed(2)} < sellStartBuyAnchor ${this.sellStartBuyAnchor.toFixed(2)} → savedBUYLTP=${this.savedBUYLTP.toFixed(2)}; silence until window ends`);
+          this.persist();
+          return;
         }
       }
     }
+
+    // SELL window is passive during ticks (we defer BUY switch to window end)
   }
 
+  // ---- Signals
   private async onBuySignal(ltp: number) {
-    // New BUY signal = new 60s window (reset the window block)
-    this.noReentryThisWindow = false;
-    this.entryIndexInBuyCycle = 0;
+    // First BUY after SELL: clear pending flag; set anchor if missing
+    this.pendingBuyAfterSell = false;
+    if (this.sellStartBuyAnchor == null) this.sellStartBuyAnchor = ltp;
 
-    if (this.state === "IDLE" && this.rollingActive) {
-      this.log(`[BUY SIGNAL] overrides rolling re-entry loop — stopping loop and entering now`);
-      this.stopRollingReentry();
+    await this.startBuyWindow(ltp);
+  }
+
+  private async onSellSignal(ltp: number) {
+    this.closeWindow();
+    this.windowDir = "SELL";
+    this.windowEndsAt = Date.now() + 60_000;
+    this.windowExited = false;
+
+    this.sellStartBuyAnchor = ltp;
+    this.savedSELLLTP = ltp;
+
+    this.pendingBuyAfterSell = true;
+    this.pendingBuyAnchor = ltp;
+
+    this.buyWindowIndexSinceLastSell = 0;
+
+    this.log(
+      `[SELL WINDOW] start 60s until ${new Date(this.windowEndsAt).toLocaleTimeString("en-GB",{ timeZone: "Asia/Kolkata" })} | anchor=${ltp.toFixed(2)} (BUY deferred to end)`
+    );
+
+    // Immediate exit if in trade, but stay in SELL window
+    if (this.state === "LONG_ACTIVE" || this.state === "PENDING_ENTRY") {
+      this.log(`[SELL WINDOW] active position → immediate exit @ (ltp-0.5); BUY window will start after SELL window ends`);
+      await this.exitLong("SELL_WINDOW_IMMEDIATE_EXIT", ltp);
     }
 
-    if (this.state !== "IDLE") {
-      this.log(`BUY ignored — current state=${this.state}`);
-      this.persist();
-      return;
-    }
-
-    this.prevSavedLTP = ltp;
-    const now = Date.now();
-    this.buySignalAt = now;
-    this.reentryDeadline = now + 60_000;
-    this.cancelReentryDueToSell = false;
-
-    this.resetSellArming();
-    this.log(`[BUY SIGNAL] → start 60s window (until ${new Date(this.reentryDeadline).toLocaleTimeString("en-GB",{ timeZone: "Asia/Kolkata" })} IST). Baseline savedLTP=${this.prevSavedLTP.toFixed(2)}`);
-
-    await this.enterLong(ltp);
-
-    this.clearReentryTimer();
-    this.reentryTimer = setTimeout(() => this.onReentryDeadline(), 60_000);
+    this.armWindowTimer();
     this.persist();
   }
 
-  private async onSellSignal(_ltp: number) {
-    this.log(`[SELL SIGNAL] state=${this.state}`);
-    this.cancelReentryDueToSell = true;
+  // ---- BUY window creation
+  private async startBuyWindow(anchorLtp: number) {
+    this.closeWindow();
+    this.windowDir = "BUY";
+    this.windowEndsAt = Date.now() + 60_000;
+    this.windowExited = false;
+    this.buyEntriesFilledThisWindow = 0;
+    this.buyWindowSilenced = false;
+    this.savedBUYLTP = anchorLtp;
 
-    switch (this.state) {
-      case "PENDING_ENTRY": {
-        await this.cancelOpenEntryIfTracked();
-        this.state = "IDLE";
-        this.resetSellArming();
-        this.log(`Cancelled pending entry on SELL signal → IDLE`);
-        break;
-      }
-      case "LONG_ACTIVE": {
-        this.sellArmed = true;
-        const ltp = await this.ensureLTP();
-        this.sellArmRefLTP = ltp;
-        this.log(`[SELL] Armed drop-exit @ <= ${(this.sellArmRefLTP - this.slPoints).toFixed(2)}`);
-        break;
-      }
-      case "IDLE":
-      default: break;
+    this.buyWindowIndexSinceLastSell += 1;
+
+    this.log(
+      `[BUY WINDOW] start 60s (idx=${this.buyWindowIndexSinceLastSell}) until ${new Date(this.windowEndsAt).toLocaleTimeString("en-GB",{ timeZone: "Asia/Kolkata" })} | savedBUYLTP=${anchorLtp.toFixed(2)}`
+    );
+
+    if (this.state === "IDLE") {
+      await this.enterLong(anchorLtp);
     }
+
+    this.armWindowTimer();
     this.persist();
   }
 
+  // ---- Orders
   private async enterLong(ltp: number) {
-    if (this.noReentryThisWindow && this.withinWindow()) {
-      this.log(`[ENTER LONG] blocked — window currently disallows re-entry`);
-      return;
-    }
+    if (!this.isWindowActive()) { this.log(`[ENTER LONG] blocked — no active window`); return; }
+    if (this.windowExited) { this.log(`[ENTER LONG] blocked — window exit already consumed`); return; }
+    if (this.windowDir === "BUY" && this.buyWindowSilenced) { this.log(`[ENTER LONG] blocked — BUY window silenced`); return; }
+    if (this.state !== "IDLE") { this.log(`[ENTER LONG] ignored — state=${this.state}`); return; }
 
     const qty = calculateQuantityForOrderValue(this.underlying, ltp, this.orderValue);
-
     this.entryRefLTP = ltp;
     const buyLimit = roundToTick(ltp + ENTRY_OFFSET);
-    this.log(`[ENTER LONG] idx=${this.entryIndexInBuyCycle + 1} qty=${qty}, LIMIT=${buyLimit}, LTP=${ltp}`);
+    this.log(`[ENTER LONG] window=${this.windowDir} nextFill=${this.buyEntriesFilledThisWindow + 1} qty=${qty}, LIMIT=${buyLimit}, LTP=${ltp}`);
 
     const entry = await placeLimitOrderV3({
       symbol: this.symbol,
@@ -257,19 +256,16 @@ export class TradeStateMachine {
       productType: "INTRADAY",
       validity: "DAY",
     });
-    this.entryOrderId = entry?.id;
-    this.log(`→ Entry order id=${this.entryOrderId}`);
 
+    this.entryOrderId = entry?.id;
     this.state = "PENDING_ENTRY";
     this.persist();
 
-    // TTL: only re-place if still pending, and not window-blocked
     setTimeout(async () => {
       if (this.state !== "PENDING_ENTRY" || !this.entryOrderId) return;
 
-      // If window-blocked, just try to cancel and stop
-      if (this.noReentryThisWindow && this.withinWindow()) {
-        this.log(`[ENTRY TTL] window-blocked → cancel pending and skip re-place`);
+      if (!this.isWindowActive() || this.windowExited || (this.windowDir === "BUY" && this.buyWindowSilenced)) {
+        this.log(`[ENTRY TTL] window not active/consumed/silenced → cancel pending and stop`);
         await cancelOrderV3(this.entryOrderId);
         this.entryOrderId = undefined;
         this.state = "IDLE";
@@ -277,19 +273,15 @@ export class TradeStateMachine {
         return;
       }
 
-      // 1) Check order status first
       try {
         const st = await getOrderStatusV3(this.entryOrderId);
-        if (st.found) {
-          if (!isOrderPending(st.status)) {
-            this.log(`[ENTRY TTL] status=${st.status} → no re-place`);
-            if (String(st.status).toUpperCase() === "FILLED") this.onEntryFilled();
-            return;
-          }
+        if (st.found && !isOrderPending(st.status)) {
+          this.log(`[ENTRY TTL] status=${st.status} → no re-place`);
+          if (String(st.status).toUpperCase() === "FILLED") this.onEntryFilled();
+          return;
         }
       } catch {}
 
-      // 2) Try to cancel; if broker says -52, do NOT re-place
       this.log(`[ENTRY TTL] cancelling stale entry ${this.entryOrderId} and (maybe) re-placing...`);
       const cancelRes: any = await cancelOrderV3(this.entryOrderId);
       const notPending = cancelRes?.code === -52;
@@ -299,9 +291,8 @@ export class TradeStateMachine {
       }
       this.entryOrderId = undefined;
 
-      // 3) Re-place fresh at current LTP+0.5 (only if not window-blocked)
-      if (this.noReentryThisWindow && this.withinWindow()) {
-        this.log(`[ENTRY TTL] window-blocked after cancel → skip re-place`);
+      if (!this.isWindowActive() || this.windowExited || (this.windowDir === "BUY" && this.buyWindowSilenced)) {
+        this.log(`[ENTRY TTL] window changed/consumed/silenced → skip re-place`);
         this.state = "IDLE";
         this.persist();
         return;
@@ -328,8 +319,8 @@ export class TradeStateMachine {
   public onEntryFilled() {
     if (this.state === "PENDING_ENTRY") {
       this.state = "LONG_ACTIVE";
-      this.entryIndexInBuyCycle += 1;
-      this.log(`[FILL] Entry filled → LONG_ACTIVE (cycle idx=${this.entryIndexInBuyCycle})`);
+      this.buyEntriesFilledThisWindow += 1;
+      this.log(`[FILL] Entry filled → LONG_ACTIVE (fills this window=${this.buyEntriesFilledThisWindow})`);
       this.persist();
     }
   }
@@ -339,8 +330,7 @@ export class TradeStateMachine {
     const qty = calculateQuantityForOrderValue(this.underlying, ltp, this.orderValue);
     const sellLimit = roundToTick(ltp - EXIT_OFFSET);
 
-    this.log(`[EXIT LONG] reason=${reason}, idx=${this.entryIndexInBuyCycle}, qty=${qty}, limit=${sellLimit}, LTP=${ltp}`);
-
+    this.log(`[EXIT LONG] reason=${reason}, qty=${qty}, limit=${sellLimit}, LTP=${ltp}`);
     try {
       await placeLimitOrderV3({
         symbol: this.symbol,
@@ -355,113 +345,55 @@ export class TradeStateMachine {
     }
 
     await this.cancelOpenEntryIfTracked();
-    this.resetSellArming();
     this.entryRefLTP = null;
     this.state = "IDLE";
     this.persist();
-
-    // NOTE: if exit happened inside the 60s window, we do NOT start rolling re-entry now.
-    if (!this.withinWindow() && reason !== "SELL_ARM_DROP_EXIT") {
-      // For post-window loss exits, keep previous behavior if you like:
-      // this.startRollingReentry();
-    }
   }
 
-  private async onReentryDeadline() {
-    if (!this.reentryDeadline) return;
+  // ---- window helpers
+  private armWindowTimer() {
+    if (this.reentryTimer) clearTimeout(this.reentryTimer);
+    const ms = Math.max(0, (this.windowEndsAt ?? Date.now()) - Date.now());
+    this.reentryTimer = setTimeout(() => this.onWindowEnd(), ms);
+  }
 
-    this.log(`[REENTRY CHECK @60s] window expired, evaluating...`);
+  private async onWindowEnd() {
     this.reentryTimer = null;
+    const endedDir = this.windowDir;
+    this.log(`[WINDOW END] ${endedDir ?? "NONE"} window ended`);
 
-    // If blocked for this window, do nothing.
-    if (this.noReentryThisWindow) {
-      this.log(`[REENTRY CHECK] window-blocked flag set → skipping re-entry`);
-      this.clearWindowAndLoop();
+    // SELL → deferred BUY
+    if (endedDir === "SELL" && this.pendingBuyAfterSell && this.pendingBuyAnchor != null) {
+      const anchor = this.pendingBuyAnchor;
+      this.pendingBuyAfterSell = false;
+      this.pendingBuyAnchor = null;
+      await this.startBuyWindow(anchor);
       return;
     }
 
-    if (this.state !== "IDLE") return;
-    if (this.cancelReentryDueToSell) return;
-    if (this.prevSavedLTP == null) return;
-
-    const ltp = await this.ensureLTP();
-    if (ltp > this.prevSavedLTP) {
-      this.log(`[REENTRY OK] LTP ${ltp} > prev ${this.prevSavedLTP} → re-enter`);
-      await this.enterLong(ltp);
-    } else {
-      this.log(`[REENTRY FAIL] LTP ${ltp} ≤ prev ${this.prevSavedLTP} — no re-entry`);
-    }
-    this.persist();
-  }
-
-  private startRollingReentry() {
-    if (this.cancelReentryDueToSell) return;
-    if (this.prevSavedLTP == null) {
-      this.log(`[REENTRY ROLLING] cannot start — prevSavedLTP is null`);
+    // BUY window ended while silenced → auto new BUY window with current savedBUYLTP
+    if (endedDir === "BUY" && this.buyWindowSilenced) {
+      const anchor = this.savedBUYLTP ?? (await this.ensureLTP());
+      this.buyWindowSilenced = false;
+      await this.startBuyWindow(anchor);
       return;
     }
-    this.rollingActive = true;
-    this.reentryDeadline = Date.now() + 60_000;
-    this.clearReentryTimer();
-    this.reentryTimer = setTimeout(() => this.checkRollingReentry(), 60_000);
-    this.log(`[REENTRY ROLLING] started 60s cooldown (until ${new Date(this.reentryDeadline).toLocaleTimeString("en-GB", { timeZone: "Asia/Kolkata" })} IST) waiting for LTP > ${this.prevSavedLTP.toFixed(2)}`);
+
+    this.closeWindow();
     this.persist();
   }
 
-  private stopRollingReentry() {
-    if (!this.rollingActive) return;
-    this.rollingActive = false;
-    this.clearReentryTimer();
-    this.reentryDeadline = null;
-    this.log(`[REENTRY ROLLING] stopped`);
-    this.persist();
-  }
-
-  private async checkRollingReentry() {
+  private closeWindow() {
+    this.windowDir = null;
+    this.windowEndsAt = null;
+    this.windowExited = false;
+    this.buyEntriesFilledThisWindow = 0;
+    if (this.reentryTimer) clearTimeout(this.reentryTimer);
     this.reentryTimer = null;
-    if (!this.rollingActive) return;
-    if (this.state !== "IDLE") {
-      this.log(`[REENTRY ROLLING] aborted — state=${this.state}`);
-      this.stopRollingReentry();
-      return;
-    }
-    if (this.cancelReentryDueToSell) {
-      this.log(`[REENTRY ROLLING] cancelled by SELL signal`);
-      this.stopRollingReentry();
-      return;
-    }
-    if (this.prevSavedLTP == null) {
-      this.log(`[REENTRY ROLLING] prevSavedLTP missing — stopping`);
-      this.stopRollingReentry();
-      return;
-    }
-
-    const ltp = await this.ensureLTP();
-    if (ltp > this.prevSavedLTP) {
-      this.log(`[REENTRY ROLLING] OK: LTP ${ltp} > prev ${this.prevSavedLTP} → re-enter now`);
-      await this.enterLong(ltp);
-      this.stopRollingReentry();
-      this.persist();
-    } else {
-      this.log(`[REENTRY ROLLING] WAIT: LTP ${ltp} ≤ prev ${this.prevSavedLTP} — schedule next 60s`);
-      this.startRollingReentry();
-    }
   }
 
-  private clearReentryTimer() { if (this.reentryTimer) clearTimeout(this.reentryTimer); this.reentryTimer = null; }
-
-  private clearWindowAndLoop() {
-    this.clearReentryTimer();
-    this.buySignalAt = null;
-    this.reentryDeadline = null;
-    this.cancelReentryDueToSell = false;
-    this.rollingActive = false;
-    // Do not touch noReentryThisWindow here — it naturally expires since window ended
-    this.persist();
-  }
-
-  private withinWindow(): boolean {
-    return this.reentryDeadline != null && Date.now() <= this.reentryDeadline!;
+  private isWindowActive() {
+    return this.windowDir != null && this.windowEndsAt != null && Date.now() <= this.windowEndsAt;
   }
 
   private async ensureLTP(pref?: number): Promise<number> {
@@ -479,10 +411,5 @@ export class TradeStateMachine {
       this.entryOrderId = undefined;
       this.persist();
     }
-  }
-
-  private resetSellArming() {
-    this.sellArmed = false;
-    this.sellArmRefLTP = null;
   }
 }
