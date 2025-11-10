@@ -425,8 +425,24 @@ setInterval(refresh, 2000);
 </html>`);
   });
 
+  /* ------------------------------ Dev Tick Injector ------------------------ */
+  // Usage:  GET /api/inject-tick?sym=NSE:XXXX&ltp=123.45
+  app.get("/api/inject-tick", (req, res) => {
+    const sym = String(req.query.sym || "");
+    const ltp = Number(req.query.ltp);
+    if (!sym || !Number.isFinite(ltp)) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Usage: /api/inject-tick?sym=SYMBOL&ltp=123.45" });
+    }
+    dataSocket.injectTick(sym, ltp, Date.now());
+    res.json({ ok: true, sym, ltp });
+  });
+
   app.listen(PORT, () => {
-    console.log(`[server] Listening on ${PORT} (papertrade=${isPaper()}) — relay UI at http://localhost:${PORT}/relays  |  status UI at /status-ui  |  pnl UI at /pnl-ui`);
+    console.log(
+      `[server] Listening on ${PORT} (papertrade=${isPaper()}) — relay UI at http://localhost:${PORT}/relays  |  status UI at /status-ui  |  pnl UI at /pnl-ui`
+    );
   });
 }
 
