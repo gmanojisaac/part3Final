@@ -1,143 +1,164 @@
-/* server/dataSocket.ts
- * FYERS official SDK wrapper (fyers-api-v3). Connects WS,
- * subscribes symbols, parses ticks, forwards to onTickFromMarket().
+/* eslint-disable no-console */
+
+/**
+ * Lightweight market-data hub used by the state machine.
+ * - Caches latest LTP per symbol
+ * - Lets modules register per-symbol tick listeners via `onSymbolTick`
+ * - Exposes `nowLtp(symbol)` for quick reads
  *
- * Prereq:
- *   npm i fyers-api-v3 ws
+ * FYERS WebSocket integration:
+ *   - connect() now initializes the FYERS WS (via fyersSocket.ts)
+ *   - ensureSubscribed(symbol) actually calls subscribeSymbols()
  */
 
-import path from "path";
-import fs from "fs";
-import { onTickFromMarket } from "./fyersClient";
+import { connectFyersSocket, subscribeSymbols } from "./fyersSocket";
 
-// FYERS SDK is CommonJS without TS types.
-const { fyersDataSocket: DataSocket } = require("fyers-api-v3");
+type TickHandler = (ltp: number, raw?: unknown) => void;
 
-function ensureDir(p?: string) {
-  if (!p) return undefined;
-  const abs = path.resolve(p);
-  try {
-    fs.mkdirSync(abs, { recursive: true });
-    return abs;
-  } catch (e: any) {
-    console.warn("[dataSocket] cannot create log dir:", abs, e?.message || e);
-    return undefined;
-  }
+const LAST_LTP = new Map<string, { ltp: number; ts: number }>();
+const LISTENERS = new Map<string, Set<TickHandler>>();
+const SUBSCRIBED = new Set<string>();
+
+let socketConnected = false;
+
+// ---- Core wiring ------------------------------------------------------------
+
+function _hhmmss() {
+  return new Date().toTimeString().slice(0, 8);
 }
 
-function parseTickMessage(msg: any): Array<{ symbol: string; ltp: number; ts?: number }> {
-  const out: Array<{ symbol: string; ltp: number; ts?: number }> = [];
-  if (!msg) return out;
-
-  // SDK usually sends strings → parse JSON
-  if (typeof msg === "string") {
-    try { msg = JSON.parse(msg); } catch { return out; }
-  }
-
-  // Batch: { d: [ { s:"NSE:...", v:{ lp:123.4, tt: 1731300000000 } }, ... ] }
-  if (Array.isArray(msg?.d)) {
-    for (const row of msg.d) {
-      const s = row?.s || row?.symbol;
-      const lp = row?.v?.lp ?? row?.v?.ltp ?? row?.ltp ?? row?.lp;
-      const tt = row?.v?.tt ?? row?.tt;
-      if (s && lp != null && Number.isFinite(Number(lp))) {
-        out.push({ symbol: String(s), ltp: Number(lp), ts: typeof tt === "number" ? tt : undefined });
-      }
-    }
-    return out;
-  }
-
-  // Lite: { symbol:"NSE:...", ltp:123.4, ts?: 173130... }
-  if (msg?.symbol && (msg?.ltp != null || msg?.lp != null)) {
-    const s = String(msg.symbol);
-    const lp = Number(msg.ltp ?? msg.lp);
-    if (Number.isFinite(lp)) out.push({ symbol: s, ltp: lp, ts: typeof msg.ts === "number" ? msg.ts : undefined });
-    return out;
-  }
-
-  return out;
+/** Establish upstream socket (FYERS WS) */
+export async function connect(): Promise<void> {
+  // Initialize upstream FYERS socket now
+  await connectFyersSocket();
 }
 
-class FyersDataSocketWrapper {
-  private skt: any = null;
-  private connected = false;
-  private wantSymbols = new Set<string>();
+/** Called by your socket bootstrap when connection state changes */
+export function setSocketConnected(connected: boolean) {
+  socketConnected = connected;
+  console.log(`[dataSocket] ${connected ? "connected (FYERS SDK)" : "socket closed"}`);
+}
 
-  async connect() {
-    const APPID = (process.env.FYERS_APP_ID || "").trim();
-    const RAW = (process.env.FYERS_ACCESS_TOKEN || "").trim();
-    if (!APPID || !RAW) {
-      console.warn("[dataSocket] FYERS_APP_ID / FYERS_ACCESS_TOKEN missing; live data will not stream.");
-      return;
-    }
+/** Push raw ticks into the hub (call this from your SDK onTick) */
+export function ingestSdkTick(symbol: string, ltp: number, raw?: unknown) {
+  LAST_LTP.set(symbol, { ltp, ts: Date.now() });
 
-    const accessToken = `${APPID}:${RAW}`;
-    const logPath = ensureDir(process.env.FYERS_LOG_PATH || "");
-
-    try {
-      // Pass logPath only if available; otherwise SDK tries to write and fails
-      this.skt = logPath ? DataSocket.getInstance(accessToken, logPath) : DataSocket.getInstance(accessToken);
-    } catch (e: any) {
-      console.error("[dataSocket] getInstance error:", e?.message || e);
-      return;
-    }
-
-    this.skt.on("connect", () => {
-      this.connected = true;
-      console.log("[dataSocket] connected (FYERS SDK)");
-      if (this.wantSymbols.size) {
-        const subs = Array.from(this.wantSymbols);
-        try {
-          this.skt.subscribe(subs);
-          console.log("[dataSocket] → SUB", subs.join(", "));
-        } catch (e: any) {
-          console.error("[dataSocket] subscribe error:", e?.message || e);
-        }
-      }
-    });
-
-    this.skt.on("message", (message: any) => {
-      const ticks = parseTickMessage(message);
-      for (const t of ticks) {
-        onTickFromMarket(t.symbol, t.ltp, t.ts ?? Date.now());
-      }
-    });
-
-    this.skt.on("error", (err: any) => {
-      console.warn("[dataSocket] error:", err?.message || err);
-    });
-
-    this.skt.on("close", () => {
-      this.connected = false;
-      console.warn("[dataSocket] socket closed");
-      // SDK will reconnect if enabled
-    });
-
-    try {
-      this.skt.connect();
-      this.skt.autoreconnect();
-    } catch (e: any) {
-      console.error("[dataSocket] connect/autoreconnect error:", e?.message || e);
-    }
-  }
-
-  /** Subscribe a FYERS symbol, e.g. "NSE:NIFTY25N1125600CE" */
-  async subscribe(symbol: string) {
-    this.wantSymbols.add(symbol);
-    if (this.connected && this.skt) {
+  const set = LISTENERS.get(symbol);
+  if (set && set.size) {
+    for (const cb of set) {
       try {
-        this.skt.subscribe([symbol]);
-        console.log("[dataSocket] → SUB", symbol);
-      } catch (e: any) {
-        console.error("[dataSocket] subscribe error:", e?.message || e);
+        cb(ltp, raw);
+      } catch (err) {
+        console.error(`[dataSocket] listener error for ${symbol}:`, err);
       }
     }
   }
+}
 
-  /** Dev/test helper used by sanity scripts */
-  injectTick(symbol: string, ltp: number, ts: number) {
-    onTickFromMarket(symbol, ltp, ts);
+/** Return latest known LTP (or null if we have none yet) */
+export function nowLtp(symbol: string): number | null {
+  return LAST_LTP.get(symbol)?.ltp ?? null;
+}
+
+/**
+ * Register a per-symbol tick callback.
+ * Returns an unsubscribe function.
+ */
+export function onSymbolTick(symbol: string, cb: TickHandler): () => void {
+  let set = LISTENERS.get(symbol);
+  if (!set) {
+    set = new Set();
+    LISTENERS.set(symbol, set);
+  }
+  set.add(cb);
+
+  // If this is the first listener, ensure we are subscribed upstream.
+  if (!SUBSCRIBED.has(symbol)) {
+    ensureSubscribed(symbol);
+  }
+
+  // Emit cached LTP immediately if available.
+  const cached = LAST_LTP.get(symbol);
+  if (cached) {
+    setTimeout(() => {
+      try {
+        cb(cached.ltp);
+      } catch {
+        /* ignore */
+      }
+    }, 0);
+  }
+
+  return () => {
+    const s = LISTENERS.get(symbol);
+    if (!s) return;
+    s.delete(cb);
+  };
+}
+
+/** Ask the upstream SDK to subscribe (idempotent) */
+export function ensureSubscribed(symbol: string) {
+  if (SUBSCRIBED.has(symbol)) return;
+  SUBSCRIBED.add(symbol);
+  console.log(`[dataSocket] → SUB ${symbol}`);
+
+  // 🔗 actually subscribe upstream now
+  try {
+    subscribeSymbols([symbol]);
+  } catch (e) {
+    console.warn(`[dataSocket] upstream subscribe failed for ${symbol}:`, e);
   }
 }
 
-export const dataSocket = new FyersDataSocketWrapper();
+/** Optional helper if you want to force a subscription explicitly from other modules */
+export function subscribe(symbol: string) {
+  ensureSubscribed(symbol);
+}
+
+/** Testing/dev utility: inject a fake tick (e.g., from tests) */
+export function injectTick(symbol: string, ltp: number, ts?: number) {
+  LAST_LTP.set(symbol, { ltp, ts: ts ?? Date.now() });
+  console.log(`[dataSocket] (inject) ${symbol} -> ${ltp}`);
+  ingestSdkTick(symbol, ltp, { injected: true, ts: ts ?? Date.now() });
+}
+
+/** Expose last-tick map for diagnostics */
+export function __peekLastTicks() {
+  return new Map(LAST_LTP);
+}
+
+/** Simple heartbeat log */
+export function __logReconnectAttempt(n: number) {
+  console.log("trying to reconnect ", n);
+}
+
+/** Used by your SDK layer when it has actually subscribed upstream */
+export function __markSubscribed(symbols: string[]) {
+  for (const s of symbols) SUBSCRIBED.add(s);
+}
+
+/** Clear all runtime state */
+export function __resetAll() {
+  LAST_LTP.clear();
+  for (const s of LISTENERS.values()) s.clear();
+  LISTENERS.clear();
+  SUBSCRIBED.clear();
+  socketConnected = false;
+}
+
+// ---- Public facade object (legacy) -----------------------------------------
+
+export const dataSocket = {
+  connect,
+  setSocketConnected,
+  ingestSdkTick,
+  injectTick,
+  nowLtp,
+  onSymbolTick,
+  ensureSubscribed,
+  subscribe,
+  __peekLastTicks,
+  __logReconnectAttempt,
+  __markSubscribed,
+  __resetAll,
+};

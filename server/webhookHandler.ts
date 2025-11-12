@@ -1,121 +1,152 @@
-// server/webhookHandler.ts
-import { dataSocket } from "./dataSocket";
+/* eslint-disable no-console */
+
 import { TradeStateMachine } from "./stateMachine";
-import { parseWebhookSym } from "./symbolFormat";
 import { getQuotesV3, isPaper } from "./fyersClient";
 import { isMarketOpen, marketClock } from "./marketHours";
+import { ensureSubscribed, onSymbolTick, nowLtp } from "./dataSocket";
 
-/** One machine per FYERS symbol */
-const machines = new Map<string, TradeStateMachine>();
-
-function getOrCreateMachine(fyersSymbol: string, underlying: string) {
-  let m = machines.get(fyersSymbol);
-  if (!m) {
-    m = new TradeStateMachine({
-      symbol: fyersSymbol,
-      underlying,
-      orderValue: Number(process.env.ORDER_VALUE || 100000),
-      slPoints: Number(process.env.SL_POINTS || 0.5),
-    });
-    machines.set(fyersSymbol, m);
-    console.log(`[INIT] machine for ${fyersSymbol}`);
-  }
-  return m;
+// If you already have a richer mapper, swap this with your real one.
+function mapToFyersSymbol(human: string): string {
+  // Example: NIFTY251118C25850 -> NSE:NIFTY25N1825850CE
+  // Keep your real implementation if you have one.
+  const m = /^NIFTY(\d{2})(\d{2})(\d{2})([CP])(\d+)$/.exec(human);
+  if (!m) return human.startsWith("NSE:") ? human : `NSE:${human}`;
+  const [_, yy, mm, dd, cp, strike] = m;
+  const monthMap: Record<string, string> = {
+    "01": "J", "02": "F", "03": "M", "04": "A", "05": "M", "06": "J",
+    "07": "J", "08": "A", "09": "S", "10": "O", "11": "N", "12": "D",
+  };
+  const monCode = monthMap[mm] ?? "N";
+  const cepe = cp === "C" ? "CE" : "PE";
+  return `NSE:NIFTY${yy}${monCode}${dd}${strike}${cepe}`;
 }
 
-/** Parse side + symbol (+ optional seed price from stopPx or '@ price') */
-function parseSideSymAndSeed(
-  raw: string
-): { side: "BUY" | "SELL"; rawSymbol: string; seedPx?: number } | null {
-  const txt = raw.trim().toUpperCase();
-
-  // "BUY <SYMBOL> @ <PRICE>"
-  {
-    const m = txt.match(/\b(BUY|SELL)\s+([A-Z]+(?:NIFTY)?\d{6}[CP]\d+)\s*@\s*([0-9]+(?:\.[0-9]+)?)\b/);
-    if (m) return { side: m[1] as "BUY" | "SELL", rawSymbol: m[2], seedPx: Number(m[3]) };
-  }
-  // "BUY <SYMBOL>" / "SELL <SYMBOL>"
-  {
-    const m = txt.match(/\b(BUY|SELL)\s+([A-Z]+(?:NIFTY)?\d{6}[CP]\d+)\b/);
-    if (m) return { side: m[1] as "BUY" | "SELL", rawSymbol: m[2] };
-  }
-  // Rich format: ... | sym=...  + optional stopPx=
-  const isEntry = /\bENTRY\b/.test(txt);
-  const isExit = /\bEXIT\b/.test(txt);
-  const side: "BUY" | "SELL" | null = isEntry ? "BUY" : isExit ? "SELL" : null;
+// Parse a simple plaintext payload like the ones in your logs.
+// e.g. "upCEAccepted Exit + priorRisePct= 0.00 | stopPx=168.50 | sym=NIFTY251118C25850"
+function parseWebhook(text: string): {
+  side: "BUY" | "SELL";
+  stopPx?: number;
+  symbol?: string;
+  raw: string;
+} {
+  const raw = text;
+  const side: "BUY" | "SELL" = /side=SELL|Exit/i.test(text) ? "SELL" : "BUY";
+  const stopMatch = /stopPx\s*=\s*([0-9.]+)/i.exec(text);
   const symMatch =
-    txt.match(/\bsym\s*=\s*([A-Z]+(?:NIFTY)?\d{6}[CP]\d+)\b/) ||
-    txt.match(/\bsym\s*:\s*([A-Z]+(?:NIFTY)?\d{6}[CP]\d+)\b/);
-  const stopPxMatch = txt.match(/\bstoppx\s*=\s*([0-9]+(?:\.[0-9]+)?)\b/i);
-  const seedPx = stopPxMatch ? Number(stopPxMatch[1]) : undefined;
-  if (side && symMatch) return { side, rawSymbol: symMatch[1], seedPx };
-  const token = txt.match(/\b([A-Z]+(?:NIFTY)?\d{6}[CP]\d+)\b/);
-  if (token && side) return { side, rawSymbol: token[1], seedPx };
-
-  return null;
-}
-
-/** Wait for a fresh LTP that arrived *after* subscribeTs (i.e., from live feed) */
-async function waitForFreshLTP(symbol: string, subscribeTs: number, timeoutMs: number): Promise<number | null> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const q = await getQuotesV3(symbol);
-    const lp = (q as any)?.d?.[0]?.v?.lp ?? null;
-    const ts = (q as any)?.d?.[0]?.v?.tt ?? (q as any)?.ts ?? null;
-    if (lp != null && ts != null && Number(ts) >= subscribeTs) return lp as number;
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  return null;
-}
-
-/** Handle incoming text payloads (simple + '@ price' + rich) */
-export async function handleWebhookText(bodyText: string) {
-  const text = (bodyText || "").trim();
-  if (!text) throw new Error("Empty webhook body");
-
-  console.log(`[webhookHandler] Received: ${text}`);
-
-  const parsed = parseSideSymAndSeed(text);
-  if (!parsed) throw new Error(`Cannot parse webhook: ${bodyText}`);
-
-  // ---- MARKET WINDOW GUARD ----
-  const allowAfterHours = (process.env.ALLOW_AFTER_HOURS || "").toLowerCase() === "true";
-  const clock = marketClock();
-  if (!allowAfterHours && !isMarketOpen()) {
-    return {
-      ok: false,
-      ignored: true,
-      reason: "Market closed",
-      clock,
-      hint: "Set ALLOW_AFTER_HOURS=true to bypass this gate (for testing).",
-    };
-  }
-
-  const { side, rawSymbol } = parsed; // we will NOT seed for entries here
-  const { fyers, underlying } = parseWebhookSym(rawSymbol);
-  console.log(`[webhookHandler] side=${side}, symbol=${rawSymbol} → ${fyers}`);
-
-  // Subscribe and wait for a fresh tick from live socket
-  const subscribeTs = Date.now();
-  await dataSocket.subscribe(fyers);
-
-  const timeoutMs = Number(process.env.LTP_WAIT_MS || 3000);
-  const ltp = await waitForFreshLTP(fyers, subscribeTs, timeoutMs);
-  if (ltp == null) {
-    throw new Error(`LTP not found for ${fyers} within ${timeoutMs}ms (waiting for live tick).`);
-  }
-
-  // Route to state machine
-  const m = getOrCreateMachine(fyers, underlying);
-  if (side === "BUY") await m.onSignal("BUY_SIGNAL");
-  else await m.onSignal("SELL_SIGNAL");
-
+    /sym\s*=\s*([A-Z0-9:._-]+)/i.exec(text) ||
+    /symbol\s*=\s*([A-Z0-9:._-]+)/i.exec(text);
   return {
-    ok: true,
-    symbol: fyers,
-    action: side === "BUY" ? "BUY_SIGNAL" : "SELL_SIGNAL",
-    ltp,
-    clock,
-    state: (m as any).getState ? (m as any).getState() : undefined,
+    side,
+    stopPx: stopMatch ? Number(stopMatch[1]) : undefined,
+    symbol: symMatch ? symMatch[1] : undefined,
+    raw,
+  };
+}
+
+/**
+ * Try to get an LTP for `symbol` quickly:
+ * 1) Use in-memory last tick (nowLtp)
+ * 2) Use cached quote (getQuotesV3)
+ * 3) Subscribe and wait for first tick (up to timeoutMs)
+ * 4) If still nothing, return `fallbackPx` (if provided) or throw
+ */
+async function getLtpWithFallback(
+  symbol: string,
+  opts: { timeoutMs?: number; fallbackPx?: number } = {}
+): Promise<number> {
+  const timeoutMs = opts.timeoutMs ?? 3000;
+
+  // 1) quick cache
+  const cached = nowLtp(symbol);
+  if (cached != null) return cached;
+
+  // 2) server-side quote cache
+  const q = await getQuotesV3(symbol);
+  const qSym = q[symbol];
+  if (qSym && Number(qSym.ltp) > 0) return qSym.ltp;
+
+  // 3) live subscribe + wait for first tick
+  ensureSubscribed(symbol);
+  const ltpFromTick = await new Promise<number | null>((resolve) => {
+    let done = false;
+
+    const off = onSymbolTick(symbol, (ltp) => {
+      if (done) return;
+      done = true;
+      off();
+      resolve(ltp);
+    });
+
+    setTimeout(() => {
+      if (done) return;
+      done = true;
+      off();
+      resolve(null);
+    }, timeoutMs);
+  });
+
+  if (ltpFromTick != null) return ltpFromTick;
+
+  // 4) fallback
+  if (opts.fallbackPx != null) {
+    console.warn(
+      `[webhookHandler] LTP not received for ${symbol} within ${timeoutMs}ms — using fallback ${opts.fallbackPx}`
+    );
+    return opts.fallbackPx;
+  }
+
+  // no fallback → throw (old behavior)
+  throw new Error(
+    `LTP not found for ${symbol} within ${timeoutMs}ms (waiting for live tick).`
+  );
+}
+
+/**
+ * Main entry from server/index.ts
+ * Accepts the webhook text/body, parses it, resolves symbol & price,
+ * and forwards a BUY/SELL signal into the per-symbol state machine.
+ */
+export async function handleWebhookText(text: string) {
+  console.log("[webhookHandler] Received:", text);
+
+  const parsed = parseWebhook(text);
+  if (!parsed.symbol) {
+    throw new Error("Webhook missing symbol.");
+  }
+
+  const fyersSymbol = mapToFyersSymbol(parsed.symbol);
+  console.log(
+    `[webhookHandler] side=${parsed.side}, symbol=${parsed.symbol} → ${fyersSymbol}`
+  );
+
+  // Get a reasonable LTP (won’t throw if we have a fallback stopPx)
+  const ltp = await getLtpWithFallback(fyersSymbol, {
+    timeoutMs: 3000,
+    fallbackPx: parsed.stopPx, // use stopPx if no tick arrives in time
+  });
+
+  // Construct machine (your legacy ctor passes a config object)
+  const m = new TradeStateMachine({
+    symbol: fyersSymbol,
+    underlying: "NIFTY", // optional if you want it
+    orderValue: Number(process.env.ORDER_VALUE || 0),
+    slPoints: Number(process.env.SL_POINTS || 0.5),
+  });
+
+  // Fire signal the way your legacy code expects
+  if (parsed.side === "BUY") {
+    await m.onSignal("BUY_SIGNAL", ltp, undefined, { source: "webhook" });
+  } else {
+    await m.onSignal("SELL_SIGNAL", ltp, "EXIT_ONLY", { source: "webhook" });
+  }
+}
+
+// (Optional) expose a tiny status helper if your server wants it
+export function webhookStatus() {
+  const clock = marketClock();
+  return {
+    paper: isPaper(),
+    marketOpen: isMarketOpen(),
+    nowOpen: clock.isMarketOpenNow(),
   };
 }

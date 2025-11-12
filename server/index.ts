@@ -1,338 +1,104 @@
-// server/index.ts
-import dotenv from "dotenv";
-dotenv.config();
+// ---------------------------------------------------------------------------
+// ✅ Load environment variables FIRST — before importing anything else.
+// ---------------------------------------------------------------------------
+import "dotenv/config";
 
+// ---------------------------------------------------------------------------
+// Imports
+// ---------------------------------------------------------------------------
 import express from "express";
 import bodyParser from "body-parser";
-import cors from "cors";
-import { isPaper, getPnL } from "./fyersClient";
-import { dataSocket } from "./dataSocket";
 import { handleWebhookText } from "./webhookHandler";
-import { getRelays, addRelay, removeRelay } from "./relayStore";
+import { dataSocket } from "./dataSocket";
+import { getPnL, isPaper } from "./fyersClient";
 import { marketClock } from "./marketHours";
+import { getRelays, relayToAll } from "./relayStore";
+import { webhookStatus } from "./webhookHandler";
 
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+// ---------------------------------------------------------------------------
+// Express setup
+// ---------------------------------------------------------------------------
+const PORT = Number(process.env.PORT || 3000);
+const app = express();
+app.use(bodyParser.text({ type: "*/*" }));
 
-/** Relay helper */
-async function relayToPeers(originalContentType: string | undefined, rawBody: string) {
-  const peers = getRelays();
-  if (peers.length === 0) return;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
-
-  await Promise.allSettled(
-    peers.map(async (url) => {
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "content-type": originalContentType || "text/plain" },
-          body: rawBody,
-          signal: controller.signal,
-        });
-        const ok = res.ok ? "OK" : `HTTP ${res.status}`;
-        console.log(`[relay] -> ${url} : ${ok}`);
-      } catch (e: any) {
-        console.warn(`[relay] -> ${url} : ERROR ${e?.message || e}`);
-      }
-    })
-  );
-
-  clearTimeout(timeout);
+// ---------------------------------------------------------------------------
+// Safe spread helper
+// ---------------------------------------------------------------------------
+function toSpreadableObject(out: unknown): Record<string, unknown> {
+  if (out && typeof out === "object" && !Array.isArray(out)) return out as Record<string, unknown>;
+  if (Array.isArray(out)) return { items: out };
+  if (out === undefined || out === null) return {};
+  return { result: out };
 }
 
-async function main() {
-  const app = express();
-
-  app.use(cors());
-  app.use(bodyParser.json());
-  app.use(bodyParser.text({ type: ["text/*", "application/x-www-form-urlencoded"] }));
-
+// ---------------------------------------------------------------------------
+// Startup data socket (Fyers WS) before handling any requests
+// ---------------------------------------------------------------------------
+(async () => {
   await dataSocket.connect();
+})();
 
-  // Webhook
-  app.post("/webhook", async (req, res) => {
-    try {
-      const contentType = req.headers["content-type"];
-      const rawBody = typeof req.body === "string" ? req.body : JSON.stringify(req.body ?? {}, null, 0);
-      const payload =
-        typeof req.body === "string"
-          ? req.body
-          : (req.body && (req.body.text || req.body.message || req.body.payload)) || rawBody;
+// ---------------------------------------------------------------------------
+// Webhook route
+// ---------------------------------------------------------------------------
+app.post("/webhook", async (req, res) => {
+  const body = req.body?.toString()?.trim();
+  if (!body) return res.status(400).json({ error: "Empty webhook body" });
 
-      const out = await handleWebhookText(payload);
-
-      // fire-and-forget relay
-      relayToPeers(typeof contentType === "string" ? contentType : undefined, rawBody).catch(() => {});
-      res.json({ ok: true, relayedTo: getRelays().length, ...out });
-    } catch (e: any) {
-      console.error("[/webhook] error:", e);
-      res.status(400).json({ ok: false, error: e?.message || "Webhook error" });
-    }
-  });
-
-  // Status (JSON) now includes marketHours
-  app.get("/status", (_req, res) => {
+  try {
+    await handleWebhookText(body);
+    const out = await relayToAll(body);
     res.json({
-      papertrade: isPaper(),
-      pnl: getPnL(),
-      relays: getRelays(),
-      marketHours: marketClock(),
+      ok: true,
+      relayedTo: getRelays().length,
+      ...toSpreadableObject(out),
     });
-  });
+  } catch (err: any) {
+    console.error("[/webhook] error:", err);
+    res.status(500).json({ ok: false, error: err?.message ?? "Unknown error" });
+  }
+});
 
-  // Market clock only
-  app.get("/market-hours", (_req, res) => {
-    res.json(marketClock());
-  });
+// ---------------------------------------------------------------------------
+// Health & debug routes
+// ---------------------------------------------------------------------------
+app.get("/status-ui", (_req, res) => {
+  res.send(`
+    <html>
+      <head><title>Status UI</title></head>
+      <body>
+        <h2>Status</h2>
+        <pre>${JSON.stringify(webhookStatus(), null, 2)}</pre>
+      </body>
+    </html>
+  `);
+});
 
-  // PnL only
-  app.get("/pnl", (_req, res) => {
-    res.json({ papertrade: isPaper(), pnl: getPnL() });
-  });
+app.get("/pnl-ui", (_req, res) => {
+  res.json({ papertrade: isPaper(), pnl: getPnL() });
+});
 
-  // ---- Relay UI + APIs (unchanged from your current version) ----
-  app.get("/relays", (_req, res) => {
-    res.type("html").send(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Relay Peers</title>
-<style>
-:root{--fg:#111;--sub:#666;--bg:#fff;--muted:#f6f6f7;--line:#e8e8ea;}
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;margin:24px;color:var(--fg);background:var(--bg);}
-header{display:flex;gap:16px;align-items:center;margin-bottom:16px;}
-a.nav{ text-decoration:none; color:#0366d6; font-weight:600;}
-h1{font-size:20px;margin:0 0 8px 0;}
-.row{display:flex;gap:8px;margin-bottom:12px;}
-input[type="url"]{flex:1;padding:10px 12px;font-size:14px;border:1px solid var(--line);border-radius:8px;}
-button{padding:10px 14px;font-size:14px;cursor:pointer;border:1px solid var(--line);background:#fafafa;border-radius:8px;}
-table{border-collapse:collapse;width:100%;margin-top:12px;}
-td,th{border:1px solid var(--line);padding:10px;font-size:14px;}
-th{background:var(--muted);text-align:left;}
-.muted{color:var(--sub);font-size:12px;}
-</style></head>
-<body>
-<header>
-  <h1>Relay Peers</h1>
-  <a class="nav" href="/status-ui">Status</a>
-  <a class="nav" href="/pnl-ui">P&L</a>
-</header>
-<div class="row">
-  <input id="url" type="url" placeholder="https://1234-xx-xx-xx-xx.ngrok-free.app/webhook"/>
-  <button id="add">Add</button>
-  <button id="test">Send Test</button>
-</div>
-<div class="muted">Every time <code>/webhook</code> receives a message, the same body + content-type is POSTed to all peers.</div>
-<table><thead><tr><th>URL</th><th style="width:140px">Actions</th></tr></thead><tbody id="tbody"></tbody></table>
-<script>
-async function load(){
-  const r = await fetch('/api/relays'); const {relays=[]}=await r.json();
-  const tb=document.getElementById('tbody'); tb.innerHTML='';
-  relays.forEach(url=>{
-    const tr=document.createElement('tr');
-    tr.innerHTML='<td>'+url+'</td><td><button class="remove">Remove</button></td>';
-    tr.querySelector('.remove').onclick=async()=>{
-      await fetch('/api/relays',{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({url})});
-      load();
-    };
-    tb.appendChild(tr);
-  });
-}
-document.getElementById('add').onclick=async()=>{
-  const url=document.getElementById('url').value.trim(); if(!url) return;
-  const r=await fetch('/api/relays',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url})});
-  const j=await r.json(); if(!j.ok) alert(j.error||'Failed'); document.getElementById('url').value=''; load();
-};
-document.getElementById('test').onclick=async()=>{
-  const url=document.getElementById('url').value.trim();
-  const body=prompt('Optional custom payload (default: "TEST RELAY")','TEST RELAY');
-  const r=await fetch('/api/relays/test',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url: url||undefined, body})});
-  const j=await r.json(); alert(JSON.stringify(j,null,2));
-};
-load();
-</script>
-</body></html>`);
-  });
+app.get("/market-ui", (_req, res) => {
+  res.json(marketClock());
+});
 
-  app.get("/api/relays", (_req, res) => res.json({ relays: getRelays() }));
-  app.post("/api/relays", (req, res) => {
-    const url = (req.body?.url || "").toString();
-    const r = addRelay(url);
-    if (!r.ok) return res.status(400).json(r);
-    res.json({ ok: true, relays: getRelays() });
-  });
-  app.delete("/api/relays", (req, res) => {
-    const url = (req.body?.url || "").toString();
-    removeRelay(url);
-    res.json({ ok: true, relays: getRelays() });
-  });
-  app.post("/api/relays/test", async (req, res) => {
-    const url = req.body?.url ? String(req.body.url) : undefined;
-    const body = req.body?.body ?? "TEST RELAY";
-    const bodyStr = typeof body === "string" ? body : JSON.stringify(body);
-    const urls = url ? [url] : getRelays();
-    if (urls.length === 0) return res.status(400).json({ ok: false, error: "No relay URLs configured" });
+app.get("/", (_req, res) => {
+  res.send(
+    `<h2>Server running (papertrade=${isPaper()})</h2>
+     <ul>
+       <li><a href="/status-ui">Status UI</a></li>
+       <li><a href="/pnl-ui">PnL UI</a></li>
+       <li><a href="/market-ui">Market Clock</a></li>
+     </ul>`
+  );
+});
 
-    const results: Record<string, string> = {};
-    await Promise.allSettled(
-      urls.map(async (u) => {
-        try {
-          const r = await fetch(u, { method: "POST", headers: { "content-type": "text/plain" }, body: bodyStr });
-          results[u] = r.ok ? `OK (${r.status})` : `HTTP ${r.status}`;
-        } catch (e: any) {
-          results[u] = `ERROR ${e?.message || e}`;
-        }
-      })
-    );
-    res.json({ ok: true, results });
-  });
-
-  // Status UI (unchanged HTML; it will now show marketHours from /status if you render it)
-  app.get("/status-ui", (_req, res) => {
-    res.type("html").send(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Status • Papertrade & Relays</title>
-<style>
-:root{--fg:#111;--sub:#666;--bg:#fff;--muted:#f6f6f7;--line:#e8e8ea;--chip:#eef6ff;}
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;margin:24px;color:var(--fg);background:var(--bg);}
-header{display:flex;gap:16px;align-items:center;margin-bottom:16px;}
-a.nav{ text-decoration:none; color:#0366d6; font-weight:600;}
-h1{font-size:20px;margin:0 0 8px 0;}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;}
-.card{border:1px solid var(--line);border-radius:12px;padding:16px;background:#fff;}
-.label{font-size:12px;color:var(--sub);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;}
-.value{font-size:24px;font-weight:700;}
-.chip{display:inline-block;background:var(--chip);border:1px solid #d7e9ff;border-radius:999px;padding:6px 10px;font-size:12px;margin:4px 6px 0 0;}
-table{border-collapse:collapse;width:100%;}
-th,td{border:1px solid var(--line);padding:8px 10px;font-size:14px;}
-th{background:var(--muted);text-align:left;}
-.muted{color:var(--sub);font-size:12px;}
-.pos-green{color:#0a7f2e;font-weight:600;}
-.pos-red{color:#b00020;font-weight:600;}
-</style></head>
-<body>
-<header>
-  <h1>Status</h1>
-  <a class="nav" href="/relays">Relays</a>
-  <a class="nav" href="/pnl-ui">P&L</a>
-</header>
-<div class="grid">
-  <div class="card"><div class="label">Mode</div><div id="mode" class="value">—</div><div class="muted">Set PAPERTRADE=true to run the in-memory simulator.</div></div>
-  <div class="card"><div class="label">Total P&L</div><div id="total" class="value">—</div><div class="muted">Realized + Unrealized</div></div>
-  <div class="card"><div class="label">Peers</div><div id="peers" class="value">—</div><div class="muted">Configured relay targets</div></div>
-</div>
-<div class="card" style="margin-top:16px;">
-  <div class="label">By Symbol P&L</div>
-  <div class="muted">Live snapshot from <code>/status</code></div>
-  <table style="margin-top:8px"><thead><tr><th>Symbol</th><th>Pos Qty</th><th>Avg Price</th><th>Last</th><th>Realized</th><th>Unrealized</th></tr></thead><tbody id="bySymbol"><tr><td colspan="6" class="muted">Loading…</td></tr></tbody></table>
-</div>
-<div class="card" style="margin-top:16px;">
-  <div class="label">Market Hours (IST)</div>
-  <div id="mh" class="value">—</div>
-  <div class="muted">Window: <span id="mhwin">—</span> • Now: <span id="mhnow">—</span></div>
-</div>
-<script>
-async function refresh(){
-  const r=await fetch('/status'); const j=await r.json();
-  document.getElementById('mode').textContent = j.papertrade ? 'Papertrade' : 'Live';
-  const total=(j.pnl?.total ?? 0).toFixed(2), R=(j.pnl?.realized ?? 0).toFixed(2), U=(j.pnl?.unrealized ?? 0).toFixed(2);
-  document.getElementById('total').textContent = total + ' (R:'+R+', U:'+U+')';
-  document.getElementById('peers').textContent = (j.relays || []).length;
-
-  const tbody=document.getElementById('bySymbol'); const entries=Object.entries(j.pnl?.bySymbol || {});
-  tbody.innerHTML = entries.length===0
-    ? '<tr><td colspan="6" class="muted">No data</td></tr>'
-    : entries.map(([sym,v])=>{
-        const u=Number(v.unrealized||0), cls=u>=0?'pos-green':'pos-red';
-        return '<tr><td>'+sym+'</td><td>'+ (v.posQty ?? 0) +'</td><td>'+ (v.avgPrice ?? 0).toFixed(2) +'</td><td>'+ (v.last ?? 0).toFixed(2) +'</td><td>'+ (v.realized ?? 0).toFixed(2) +'</td><td class="'+cls+'">'+ u.toFixed(2) +'</td></tr>';
-      }).join('');
-
-  const mh = j.marketHours || {};
-  document.getElementById('mh').textContent = mh.open ? 'OPEN' : 'CLOSED';
-  document.getElementById('mhwin').textContent = (mh.start||'09:15') + ' - ' + (mh.end||'15:30');
-  document.getElementById('mhnow').textContent = (mh.nowIST||'—') + ' (' + (mh.weekday||'') + ')';
-}
-refresh(); setInterval(refresh, 2000);
-</script>
-</body></html>`);
-  });
-
-  // P&L UI unchanged ...
-  app.get("/pnl-ui", (_req, res) => {
-    res.type("html").send(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>P&L</title>
-<style>
-:root{--fg:#111;--sub:#666;--bg:#fff;--muted:#f6f6f7;--line:#e8e8ea;}
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;margin:24px;color:var(--fg);background:var(--bg);}
-header{display:flex;gap:16px;align-items:center;margin-bottom:16px;}
-a.nav{ text-decoration:none; color:#0366d6; font-weight:600;}
-h1{font-size:20px;margin:0 0 8px 0;}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;}
-.card{border:1px solid var(--line);border-radius:12px;padding:16px;background:#fff;}
-.label{font-size:12px;color:var(--sub);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;}
-.value{font-size:24px;font-weight:700;}
-table{border-collapse:collapse;width:100%;margin-top:8px;}
-th,td{border:1px solid var(--line);padding:8px 10px;font-size:14px;}
-th{background:var(--muted);text-align:left;}
-.pos-green{color:#0a7f2e;font-weight:600;}
-.pos-red{color:#b00020;font-weight:600;}
-</style></head>
-<body>
-<header>
-  <h1>P&L</h1>
-  <a class="nav" href="/relays">Relays</a>
-  <a class="nav" href="/status-ui">Status</a>
-</header>
-<div class="grid">
-  <div class="card"><div class="label">Mode</div><div id="mode" class="value">—</div></div>
-  <div class="card"><div class="label">Total</div><div id="total" class="value">—</div></div>
-  <div class="card"><div class="label">Realized</div><div id="realized" class="value">—</div></div>
-  <div class="card"><div class="label">Unrealized</div><div id="unrealized" class="value">—</div></div>
-</div>
-<div class="card" style="margin-top:16px;">
-  <div class="label">By Symbol</div>
-  <table><thead><tr><th>Symbol</th><th>Pos Qty</th><th>Avg Price</th><th>Last</th><th>Realized</th><th>Unrealized</th></tr></thead><tbody id="bySymbol"><tr><td colspan="6">Loading…</td></tr></tbody></table>
-</div>
-<script>
-async function refresh(){
-  const r=await fetch('/pnl'); const j=await r.json();
-  document.getElementById('mode').textContent = j.papertrade ? 'Papertrade' : 'Live';
-  document.getElementById('total').textContent = (j.pnl?.total ?? 0).toFixed(2);
-  document.getElementById('realized').textContent = (j.pnl?.realized ?? 0).toFixed(2);
-  document.getElementById('unrealized').textContent = (j.pnl?.unrealized ?? 0).toFixed(2);
-
-  const tbody=document.getElementById('bySymbol'); const entries=Object.entries(j.pnl?.bySymbol || {});
-  tbody.innerHTML = entries.length===0
-    ? '<tr><td colspan="6" class="muted">No positions</td></tr>'
-    : entries.map(([sym,v])=>{
-        const u=Number(v.unrealized||0), cls=u>=0?'pos-green':'pos-red';
-        return '<tr><td>'+sym+'</td><td>'+ (v.posQty ?? 0) +'</td><td>'+ (v.avgPrice ?? 0).toFixed(2) +'</td><td>'+ (v.last ?? 0).toFixed(2) +'</td><td>'+ (v.realized ?? 0).toFixed(2) +'</td><td class="'+cls+'">'+ u.toFixed(2) +'</td></tr>';
-      }).join('');
-}
-refresh(); setInterval(refresh, 2000);
-</script>
-</body></html>`);
-  });
-
-  // Dev tick injector
-  app.get("/api/inject-tick", (req, res) => {
-    const sym = String(req.query.sym || "");
-    const ltp = Number(req.query.ltp);
-    if (!sym || !Number.isFinite(ltp)) {
-      return res.status(400).json({ ok: false, error: "Usage: /api/inject-tick?sym=SYMBOL&ltp=123.45" });
-    }
-    dataSocket.injectTick(sym, ltp, Date.now());
-    res.json({ ok: true, sym, ltp });
-  });
-
-  app.listen(PORT, () => {
-    console.log(
-      `[server] Listening on ${PORT} (papertrade=${isPaper()}) — relay UI at http://localhost:${PORT}/relays  |  status UI at /status-ui  |  pnl UI at /pnl-ui`
-    );
-  });
-}
-
-main().catch((e) => {
-  console.error("Fatal boot error:", e);
-  process.exit(1);
+// ---------------------------------------------------------------------------
+// Start Express server
+// ---------------------------------------------------------------------------
+app.listen(PORT, () => {
+  console.log(
+    `[server] Listening on ${PORT} (papertrade=${isPaper()}) — relay UI at http://localhost:${PORT}/relays  |  status UI at /status-ui  |  pnl UI at /pnl-ui`
+  );
 });
