@@ -1,31 +1,30 @@
 /* eslint-disable no-console */
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Updated state machine to match latest spec:
 //
-// State Machine for per-symbol trading windows
-// Variant: Sell-Start Anchor + SELL-window breakout behavior
+// SELL side
+// - Start 60s SELL window on SELL_SIGNAL (both FLAT and IN-POSITION).
+// - FLAT path during SELL window:
+//     • If tick > (sellLtp + 0.5) → cancel SELL, start BUY with savedBUYLTP = (sellLtp + 0.5) + 0.5.
+//     • Else if sellStartBuyAnchor is set AND tick < sellStartBuyAnchor →
+//         cancel SELL, start BUY with savedBUYLTP = sellStartBuyAnchor.
+// - IN-POSITION path during SELL window:
+//     • On first tick(s) → EXIT full qty @ (tick - 0.5); then do NOTHING else until window end.
+// - SELL window timeout → re-start a fresh 60s SELL window (loop back to A),
+//   anchoring at current LTP, and re-checking position status.
 //
-// NEW rules implemented:
-//
-// FLAT + SELL:
-//   - Start 60s SELL window; breakout trigger @ (sellLtp + 0.5).
-//   - If breakout triggers → cancel SELL window; start BUY window immediately
-//     with savedBUYLTP = sellLtp + 0.5 (forced anchor).
-//
-// IN POSITION + SELL:
-//   - Start 60s SELL window; breakout trigger @ (sellLtp + 0.5).
-//   - If breakout triggers → exit full position (no-flip), then do nothing else
-//     for the remainder of this SELL window.
-//   - When SELL window ends → start BUY window with savedBUYLTP = sellLtp.
-//
-// Preserved behavior:
-//   - Sell-Start anchor is captured on the first BUY signal after a SELL window.
-//   - On SELL→BUY rollover (timeout), if no forced anchor is specified and no Sell-Start
-//     anchor captured, first BUY window uses rollover LTP.
-//   - During subsequent BUY windows after a SELL, if price < Sell-Start anchor,
-//     silence current BUY window and start a fresh BUY window.
-//   - Immediate BUY entry rule: if flat at BUY window start, place LIMIT @ LTP + 0.5.
-//   - No-flip exit semantics always exit the full current open qty when exiting.
-//
+// BUY side
+// - On BUY_SIGNAL:
+//     • If first BUY after a SELL → sellStartBuyAnchor = buyLtp.
+//     • savedBUYLTP = forcedAnchor (if provided) else buyLtp.
+//     • Immediately place BUY LIMIT @ (savedBUYLTP + 0.5).
+//     • If state == IDLE → start 60s BUY window.
+// - During BUY window (live ticks):
+//     • If tick < (savedBUYLTP - 0.5) → EXIT full qty @ (tick - 0.5) and go IDLE (no restart).
+//     • If FLAT and tick > savedBUYLTP → place BUY LIMIT @ (tick + 0.5) and start a new 60s BUY window.
+// - BUY window timeout → go IDLE (loop to A; wait for next signal).
+// ─────────────────────────────────────────────────────────────────────────────
 
 import {
   getOpenQty,
@@ -37,47 +36,43 @@ import {
 import { onSymbolTick, nowLtp } from "./dataSocket";
 import { isMarketOpenNow } from "./marketHours";
 
-// ---- Types ------------------------------------------------------------------
-
-export type Side = "BUY" | "SELL";
+// ── Types ────────────────────────────────────────────────────────────────────
 export type MachineState = "IDLE" | "IN_BUY_WINDOW" | "IN_SELL_WINDOW";
-
 export interface Signal {
   type: "BUY_SIGNAL" | "SELL_SIGNAL";
   ltp: number;
-  ts: number; // epoch ms
-  reason?: string; // e.g., "EXIT_ONLY"
+  ts: number;
+  reason?: string;
   raw?: unknown;
 }
-
 type TimerHandle = ReturnType<typeof setTimeout> | null;
 
-// ---- Logging helpers --------------------------------------------------------
-
-function fmtPx(n: number | null | undefined) {
-  if (n == null || Number.isNaN(n)) return "—";
-  return Number(n).toFixed(2);
-}
-function fmtTs(ts: number) {
-  const d = new Date(ts);
-  return d.toTimeString().slice(0, 8);
-}
+// ── Log helpers ──────────────────────────────────────────────────────────────
+const fmtPx = (n: number | null | undefined) =>
+  n == null || Number.isNaN(n) ? "—" : Number(n).toFixed(2);
+const fmtTs = (ts: number) => new Date(ts).toTimeString().slice(0, 8);
 function log(sym: string, msg: string) {
-  const t = new Date();
-  const hhmmss = t.toTimeString().slice(0, 8);
-  console.log(`[${hhmmss}] [${sym}] ${msg}`);
+  console.log(`[${new Date().toTimeString().slice(0, 8)}] [${sym}] ${msg}`);
 }
 function debug(sym: string, msg: string) {
   console.log(`[${fmtTs(Date.now())}] [${sym}] ${msg}`);
 }
 
-// ---- Anchor state for Sell-Start variant -----------------------------------
-
+// ── Per-symbol anchors/state ─────────────────────────────────────────────────
 type PerSymbolAnchorState = {
+  // Captured on first BUY after a SELL
   sellStartBuyAnchor: number | null;
+
+  // Anchor used when starting a BUY window (may be forced)
   savedBUYLTP: number | null;
+
+  // Whether the *next* BUY signal is the first after the most recent SELL
   pendingBuyAfterSell: boolean;
+
+  // For observability; not used for logic gates now
   buyWindowIdxSinceSell: number;
+
+  // Optional reason from SELL path
   lastSellReason: string | null;
 };
 
@@ -95,8 +90,7 @@ function ensureAnchor(sym: string): PerSymbolAnchorState {
   return ANCHOR[sym];
 }
 
-// ---- Machine per symbol -----------------------------------------------------
-
+// ── Per-symbol machine ───────────────────────────────────────────────────────
 class SymbolMachine {
   readonly sym: string;
   state: MachineState = "IDLE";
@@ -104,19 +98,19 @@ class SymbolMachine {
   private sellWindowTimer: TimerHandle = null;
   private buyWindowTimer: TimerHandle = null;
 
-  private buyWindowSilenced = false;
-
-  // SELL-window tracking & breakout context
+  // SELL context
   private sellWindowActive = false;
-  private sellWindowDoNothing = false; // if true, ignore actions until SELL window end
-  private sellWindowStartLtp: number | null = null; // LTP at SELL signal
-  private sellWindowBreakoutPx: number | null = null; // sellLtp + 0.5
-  private hadPositionOnSell: boolean = false; // whether a position existed at SELL signal
-  private breakoutTriggeredInPos: boolean = false; // IN-POS breakout occurred
+  private sellWindowDoNothing = false; // freeze actions after in-pos exit
+  private sellWindowStartLtp: number | null = null;
+  private sellWindowBreakoutPx: number | null = null;
+  private hadPositionOnSell = false;
+
+  // BUY context
+  private buyWindowActive = false;
 
   constructor(sym: string) {
     this.sym = sym;
-    log(this.sym, "[INIT] StateMachine created");
+    log(sym, "[INIT] StateMachine created");
   }
 
   handleSignal(sig: Signal) {
@@ -124,217 +118,106 @@ class SymbolMachine {
       debug(this.sym, "[SKIP] market closed, ignoring signal");
       return;
     }
-    if (sig.type === "SELL_SIGNAL") {
-      this.onSellSignal(sig);
-    } else if (sig.type === "BUY_SIGNAL") {
-      this.onBuySignal(sig);
-    }
+    if (sig.type === "SELL_SIGNAL") this.onSellSignal(sig);
+    else this.onBuySignal(sig);
   }
 
-  // ---- SELL handling --------------------------------------------------------
-
+  // ── SELL handling ──────────────────────────────────────────────────────────
   private onSellSignal(sig: Signal) {
     const openQty = getOpenQty(this.sym);
-    const hadPos = openQty > 0;
+    this.hadPositionOnSell = openQty > 0;
 
     log(this.sym, `Signal: SELL_SIGNAL @ LTP=${fmtPx(sig.ltp)} | state=${this.state}`);
-
-    // Start SELL window; arm breakout watcher @ (sellLtp + 0.5)
-    this.startSellWindow(sig.ltp, 60_000, sig.reason ?? "GENERIC", hadPos);
+    this.startSellWindow(sig.ltp, 60_000, sig.reason ?? "GENERIC");
   }
 
-  private startSellWindow(ltpAtStart: number, windowMs: number, reason: string, hadPos: boolean) {
+  private startSellWindow(sellLtp: number, windowMs: number, reason: string) {
     const a = ensureAnchor(this.sym);
     this.clearTimers();
 
-    a.pendingBuyAfterSell = true;
+    a.pendingBuyAfterSell = true; // the next BUY signal will capture sellStartBuyAnchor
     a.buyWindowIdxSinceSell = 0;
     a.lastSellReason = reason;
 
     this.state = "IN_SELL_WINDOW";
     this.sellWindowActive = true;
     this.sellWindowDoNothing = false;
-    this.hadPositionOnSell = hadPos;
-    this.breakoutTriggeredInPos = false;
-    this.sellWindowStartLtp = ltpAtStart;
-    this.sellWindowBreakoutPx = roundPrice(ltpAtStart + 0.5);
+    this.sellWindowStartLtp = sellLtp;
+    this.sellWindowBreakoutPx = roundPrice(sellLtp + 0.5);
 
     const untilTs = Date.now() + windowMs;
     log(
       this.sym,
       `[SELL WINDOW] start 60s until ${fmtTs(untilTs)} | anchor=${fmtPx(
-        ltpAtStart
-      )} (BUY deferred to end) | breakout>${fmtPx(this.sellWindowBreakoutPx)}`
+        sellLtp
+      )} | breakout>${fmtPx(this.sellWindowBreakoutPx)} | hadPos=${this.hadPositionOnSell}`
     );
 
-    // Arm breakout watcher: if LTP > (sellLtp + 0.5)
+    // Live tick watcher for SELL window
     onSymbolTick(this.sym, (tickLtp: number) => {
       if (!this.sellWindowActive) return;
-      if (this.sellWindowDoNothing) return; // already acted in this SELL window
 
-      const breakoutPx = this.sellWindowBreakoutPx!;
-      if (tickLtp > breakoutPx) {
-        if (this.hadPositionOnSell) {
-          // IN-POS: exit entire position and do nothing else until window end
-          const q = getOpenQty(this.sym);
-          if (q > 0) {
-            const px = roundPrice(tickLtp - 0.5);
-            debug(
-              this.sym,
-              `[SELL BREAKOUT] tick=${fmtPx(tickLtp)} > ${fmtPx(
-                breakoutPx
-              )} → EXIT qty=${q} @ LIMIT=${fmtPx(px)} and silence until window end`
-            );
-            placeLimitSell(this.sym, q, px, { tag: "SELL_BREAKOUT_EXIT" });
-          } else {
-            debug(this.sym, `[SELL BREAKOUT] triggered but no open qty at execution time`);
-          }
-          this.breakoutTriggeredInPos = true;
-          this.sellWindowDoNothing = true;
-        } else {
-          // FLAT: cancel SELL window and start BUY window with forced anchor = sellLtp + 0.5
-          const forcedAnchor = breakoutPx; // equals sellLtp + 0.5 (already rounded)
+      if (this.hadPositionOnSell && !this.sellWindowDoNothing) {
+        // IN-POSITION immediate exit on first ticks, then freeze.
+        const q = getOpenQty(this.sym);
+        if (q > 0) {
+          const px = roundPrice(tickLtp - 0.5);
           debug(
             this.sym,
-            `[SELL BREAKOUT] tick=${fmtPx(
-              tickLtp
-            )} > ${fmtPx(breakoutPx)} while FLAT → cancel SELL window, start BUY window (savedBUYLTP=${fmtPx(
-              forcedAnchor
-            )})`
+            `[SELL IN-POS EXIT] EXIT qty=${q} @ LIMIT=${fmtPx(px)} (tick=${fmtPx(tickLtp)}) → freeze until window end`
+          );
+          placeLimitSell(this.sym, q, px, { tag: "SELL_INPOS_IMMEDIATE_EXIT" });
+        } else {
+          debug(this.sym, `[SELL IN-POS EXIT] no open qty at execution time`);
+        }
+        this.sellWindowDoNothing = true;
+        return;
+      }
+
+      // FLAT path
+      if (!this.hadPositionOnSell) {
+        const breakoutPx = this.sellWindowBreakoutPx!;
+        if (tickLtp > breakoutPx) {
+          // cancel SELL → start BUY with savedBUYLTP = breakoutPx + 0.5
+          const forcedAnchor = roundPrice(breakoutPx + 0.5); // effectively sellLtp + 1.0
+          debug(
+            this.sym,
+            `[SELL FLAT BREAKOUT] tick=${fmtPx(tickLtp)} > ${fmtPx(
+              breakoutPx
+            )} → cancel SELL, start BUY (savedBUYLTP=${fmtPx(forcedAnchor)})`
           );
           this.cancelSellWindowTimerOnly();
           this.sellWindowActive = false;
-          this.startBuyWindow(tickLtp, 60_000, forcedAnchor);
+          this.startBuyWindow(forcedAnchor, 60_000, forcedAnchor, /*fromFlatBreakout*/ true);
+          return;
+        }
+
+        // If sellStartBuyAnchor set and tick < anchor → cancel SELL → BUY with savedBUYLTP = anchor
+        if (a.sellStartBuyAnchor != null && tickLtp < a.sellStartBuyAnchor) {
+          debug(
+            this.sym,
+            `[SELL FLAT ANCHOR BREACH] tick=${fmtPx(tickLtp)} < sellStartBuyAnchor=${fmtPx(
+              a.sellStartBuyAnchor
+            )} → cancel SELL, start BUY (savedBUYLTP=${fmtPx(a.sellStartBuyAnchor)})`
+          );
+          this.cancelSellWindowTimerOnly();
+          this.sellWindowActive = false;
+          this.startBuyWindow(a.sellStartBuyAnchor, 60_000, a.sellStartBuyAnchor);
+          return;
         }
       }
     });
 
-    // SELL window end → rollover
+    // SELL window end → re-start SELL window (loop back to A)
     this.sellWindowTimer = setTimeout(() => {
       this.sellWindowTimer = null;
       this.sellWindowActive = false;
-      log(this.sym, `[WINDOW END] SELL window ended`);
-      this.onSellWindowEnded();
+      log(this.sym, `[WINDOW END] SELL window ended → restarting SELL window`);
+      const nextAnchor = nowLtp(this.sym) ?? this.sellWindowStartLtp ?? sellLtp;
+      // refresh position status and start a new 60s SELL window
+      this.hadPositionOnSell = getOpenQty(this.sym) > 0;
+      this.startSellWindow(nextAnchor, windowMs, reason);
     }, windowMs);
-  }
-
-  private onSellWindowEnded() {
-    const a = ensureAnchor(this.sym);
-    const ltpNow = nowLtp(this.sym) ?? 0;
-
-    // If we were IN-POS and breakout already exited us, we now start a BUY window
-    // with savedBUYLTP = sellLtp (the SELL signal's LTP).
-    if (this.breakoutTriggeredInPos && this.sellWindowStartLtp != null) {
-      const forcedAnchor = this.sellWindowStartLtp;
-      debug(
-        this.sym,
-        `[SELL END] breakout-in-pos path → start BUY window with savedBUYLTP=${fmtPx(forcedAnchor)}`
-      );
-      this.startBuyWindow(ltpNow, 60_000, forcedAnchor);
-      return;
-    }
-
-    // Otherwise, normal rollover (no forced anchor): follow prior rules
-    this.startBuyWindow(ltpNow, 60_000);
-  }
-
-  // ---- BUY handling ---------------------------------------------------------
-
-  private onBuySignal(sig: Signal) {
-    const a = ensureAnchor(this.sym);
-
-    log(this.sym, `Signal: BUY_SIGNAL @ LTP=${fmtPx(sig.ltp)} | state=${this.state}`);
-
-    // Capture Sell-Start anchor once (first BUY signal after a SELL window)
-    if (a.pendingBuyAfterSell) {
-      a.sellStartBuyAnchor = sig.ltp;
-      a.pendingBuyAfterSell = false;
-      debug(
-        this.sym,
-        `[ANCHOR] captured sellStartBuyAnchor=${fmtPx(sig.ltp)} (first BUY signal after SELL)`
-      );
-    }
-
-    if (this.state === "IDLE") {
-      this.startBuyWindow(sig.ltp, 60_000);
-    }
-  }
-
-  /**
-   * Starts a BUY window.
-   * @param nowLtpPx last known LTP to use if needed
-   * @param windowMs window length
-   * @param forcedAnchor if provided, overrides the computed anchor and sets savedBUYLTP to this value
-   */
-  private startBuyWindow(nowLtpPx: number, windowMs: number, forcedAnchor?: number) {
-    const a = ensureAnchor(this.sym);
-    this.clearTimers();
-
-    // Determine anchor:
-    // - forcedAnchor takes precedence (used for the two SELL-window cases you specified)
-    // - else Sell-Start anchor (if captured)
-    // - else rollover LTP
-    const computedAnchor = forcedAnchor ?? a.sellStartBuyAnchor ?? nowLtpPx;
-
-    a.savedBUYLTP = computedAnchor;
-    a.buyWindowIdxSinceSell += 1;
-
-    this.state = "IN_BUY_WINDOW";
-    this.buyWindowSilenced = false;
-
-    const untilTs = Date.now() + windowMs;
-    log(
-      this.sym,
-      `[BUY WINDOW] start 60s (idx=${a.buyWindowIdxSinceSell}) until ${fmtTs(
-        untilTs
-      )} | savedBUYLTP=${fmtPx(computedAnchor)}${forcedAnchor != null ? " (forced)" : ""}`
-    );
-
-    // Immediate entry if flat
-    const openQty = getOpenQty(this.sym);
-    const allowImmediate = true;
-    if (openQty === 0 && allowImmediate) {
-      const ltp = nowLtp(this.sym) ?? nowLtpPx;
-      const limitPx = roundPrice(ltp + 0.5);
-      const qty = computeQtyFromPnLContext(this.sym);
-      log(
-        this.sym,
-        `[ENTER LONG] window=BUY nextFill=1 qty=${qty}, LIMIT=${fmtPx(limitPx)}, LTP=${fmtPx(ltp)}`
-      );
-      placeLimitBuy(this.sym, qty, limitPx, { tag: "BUY_WINDOW_IMMEDIATE" });
-    }
-
-    this.armBuyWindowGuards(computedAnchor, untilTs);
-  }
-
-  private armBuyWindowGuards(sellStartAnchor: number, untilTs: number) {
-    const a = ensureAnchor(this.sym);
-
-    onSymbolTick(this.sym, (tickLtp: number) => {
-      if (this.state !== "IN_BUY_WINDOW") return;
-      if (this.buyWindowSilenced) return;
-
-      if (a.buyWindowIdxSinceSell > 1 && tickLtp < sellStartAnchor) {
-        debug(
-          this.sym,
-          `[BUY WINDOW] price fell below sellStartBuyAnchor=${fmtPx(
-            sellStartAnchor
-          )} → silencing & restarting new BUY window`
-        );
-        a.savedBUYLTP = sellStartAnchor;
-        this.buyWindowSilenced = true;
-
-        this.startBuyWindow(tickLtp, 60_000);
-      }
-    });
-
-    this.buyWindowTimer = setTimeout(() => {
-      this.buyWindowTimer = null;
-      if (!this.buyWindowSilenced) {
-        log(this.sym, `[WINDOW END] BUY window ended`);
-      }
-      this.state = "IDLE";
-    }, Math.max(0, untilTs - Date.now()));
   }
 
   private cancelSellWindowTimerOnly() {
@@ -344,6 +227,120 @@ class SymbolMachine {
     }
   }
 
+  // ── BUY handling ───────────────────────────────────────────────────────────
+  private onBuySignal(sig: Signal, forcedAnchor?: number) {
+    const a = ensureAnchor(this.sym);
+
+    // First BUY after the most recent SELL captures sellStartBuyAnchor
+    if (a.pendingBuyAfterSell) {
+      a.sellStartBuyAnchor = sig.ltp;
+      a.pendingBuyAfterSell = false;
+      debug(this.sym, `[ANCHOR] captured sellStartBuyAnchor=${fmtPx(sig.ltp)} (first BUY after SELL)`);
+    }
+
+    // Calculate savedBUYLTP and place immediate buy attempt @ savedBUYLTP + 0.5
+    const saved = forcedAnchor ?? sig.ltp;
+    a.savedBUYLTP = saved;
+
+    const entryPx = roundPrice(saved + 0.5);
+    const qty = computeQtyFromPnLContext(this.sym);
+    debug(
+      this.sym,
+      `[BUY SIGNAL] savedBUYLTP=${fmtPx(saved)} → place BUY LIMIT qty=${qty} @ ${fmtPx(entryPx)}`
+    );
+    placeLimitBuy(this.sym, qty, entryPx, { tag: "BUY_SIGNAL_PREWINDOW" });
+
+    // If IDLE, start a BUY window
+    if (this.state === "IDLE") {
+      this.startBuyWindow(sig.ltp, 60_000, saved);
+    } else {
+      log(this.sym, `[BUY SIGNAL] ignored window start (active window already running)`);
+    }
+  }
+
+  private startBuyWindow(nowLtpPx: number, windowMs: number, savedAnchor: number, fromFlatBreakout = false) {
+    const a = ensureAnchor(this.sym);
+    this.clearTimers();
+
+    a.savedBUYLTP = savedAnchor;
+    a.buyWindowIdxSinceSell += 1;
+
+    this.state = "IN_BUY_WINDOW";
+    this.buyWindowActive = true;
+
+    const untilTs = Date.now() + windowMs;
+    log(
+      this.sym,
+      `[BUY WINDOW] start 60s (idx=${a.buyWindowIdxSinceSell}) until ${fmtTs(
+        untilTs
+      )} | savedBUYLTP=${fmtPx(savedAnchor)}${fromFlatBreakout ? " (from SELL-flat breakout)" : ""}`
+    );
+
+    // Live tick watcher for BUY window
+    onSymbolTick(this.sym, (tickLtp: number) => {
+      if (!this.buyWindowActive) return;
+
+      // Stop-out: tick < (savedBUYLTP - 0.5) → exit full qty and go IDLE (no restart)
+      if (tickLtp < roundPrice(savedAnchor - 0.5)) {
+        const q = getOpenQty(this.sym);
+        if (q > 0) {
+          const px = roundPrice(tickLtp - 0.5);
+          debug(
+            this.sym,
+            `[BUY STOP-OUT] tick=${fmtPx(tickLtp)} < (${fmtPx(savedAnchor)} - 0.5) → EXIT qty=${q} @ LIMIT=${fmtPx(
+              px
+            )} and go IDLE`
+          );
+          placeLimitSell(this.sym, q, px, { tag: "BUY_WINDOW_STOP_OUT" });
+        } else {
+          debug(this.sym, `[BUY STOP-OUT] condition met but no open qty`);
+        }
+        this.buyWindowActive = false;
+        this.state = "IDLE";
+        this.cancelBuyWindowTimerOnly();
+        return;
+      }
+
+      // Flat breakout up: if FLAT and tick > savedBUYLTP → buy @ (tick + 0.5) and start a fresh BUY window
+      if (getOpenQty(this.sym) === 0 && tickLtp > savedAnchor) {
+        const px = roundPrice(tickLtp + 0.5);
+        const qty2 = computeQtyFromPnLContext(this.sym);
+        debug(
+          this.sym,
+          `[BUY FLAT BREAKOUT] tick=${fmtPx(tickLtp)} > savedBUYLTP=${fmtPx(
+            savedAnchor
+          )} → place BUY LIMIT qty=${qty2} @ ${fmtPx(px)} and restart BUY window`
+        );
+        placeLimitBuy(this.sym, qty2, px, { tag: "BUY_WINDOW_BREAKOUT_REENTER" });
+
+        // restart a fresh 60s BUY window with same anchor? spec says loop to A (re-evaluate IDLE).
+        // We’ll start a new window anchored to current savedBUYLTP (unchanged) and loop.
+        this.buyWindowActive = false;
+        this.cancelBuyWindowTimerOnly();
+        this.state = "IDLE"; // go to A
+        // start new BUY window (fresh 60s)
+        this.startBuyWindow(tickLtp, windowMs, savedAnchor);
+        return;
+      }
+    });
+
+    // BUY window timeout → go IDLE (loop to A)
+    this.buyWindowTimer = setTimeout(() => {
+      this.buyWindowTimer = null;
+      this.buyWindowActive = false;
+      log(this.sym, `[WINDOW END] BUY window ended → IDLE`);
+      this.state = "IDLE";
+    }, windowMs);
+  }
+
+  private cancelBuyWindowTimerOnly() {
+    if (this.buyWindowTimer) {
+      clearTimeout(this.buyWindowTimer);
+      this.buyWindowTimer = null;
+    }
+  }
+
+  // ── Utilities ──────────────────────────────────────────────────────────────
   private clearTimers() {
     if (this.sellWindowTimer) {
       clearTimeout(this.sellWindowTimer);
@@ -353,18 +350,14 @@ class SymbolMachine {
       clearTimeout(this.buyWindowTimer);
       this.buyWindowTimer = null;
     }
-    // Reset SELL-window flags (next window will set them again)
     this.sellWindowActive = false;
+    this.buyWindowActive = false;
     this.sellWindowDoNothing = false;
-    this.sellWindowStartLtp = null;
-    this.sellWindowBreakoutPx = null;
-    this.hadPositionOnSell = false;
-    this.breakoutTriggeredInPos = false;
+    // keep hadPositionOnSell as-is; it’s set at SELL signal time
   }
 }
 
-// ---- Registry & exports -----------------------------------------------------
-
+// ── Registry & exports ───────────────────────────────────────────────────────
 const MACHINES: Record<string, SymbolMachine> = {};
 
 export function getMachine(sym: string): SymbolMachine {
@@ -378,24 +371,15 @@ export function getMachine(sym: string): SymbolMachine {
 export function handleSellSignal(sym: string, ltp: number, reason?: string, raw?: unknown) {
   getMachine(sym).handleSignal({ type: "SELL_SIGNAL", ltp, ts: Date.now(), reason, raw });
 }
-export function handleBuySignal(sym: string, ltp: number, raw?: unknown) {
-  getMachine(sym).handleSignal({ type: "BUY_SIGNAL", ltp, ts: Date.now(), raw });
+export function handleBuySignal(sym: string, ltp: number, raw?: unknown, forcedAnchor?: number) {
+  // pass forcedAnchor into onBuySignal via a wrapper call
+  (getMachine(sym) as any).onBuySignal({ type: "BUY_SIGNAL", ltp, ts: Date.now(), raw }, forcedAnchor);
 }
 
-/**
- * Compatibility class for legacy imports in webhookHandler:
- * - Accepts either a `symbol: string` OR a config object:
- *     { symbol, underlying?, orderValue?, slPoints? }
- * - Provides `onSignal("BUY_SIGNAL"|"SELL_SIGNAL")` in addition to .buy/.sell
- */
+// Compatibility class used by webhookHandler (kept)
 type LegacyCtorArg =
   | string
-  | {
-      symbol: string;
-      underlying?: string;
-      orderValue?: number;
-      slPoints?: number;
-    };
+  | { symbol: string; underlying?: string; orderValue?: number; slPoints?: number };
 
 export class TradeStateMachine {
   public readonly symbol: string;
@@ -404,38 +388,25 @@ export class TradeStateMachine {
   public readonly slPoints?: number;
 
   constructor(arg: LegacyCtorArg) {
-    if (typeof arg === "string") {
-      this.symbol = arg;
-    } else {
+    if (typeof arg === "string") this.symbol = arg;
+    else {
       this.symbol = arg.symbol;
       this.underlying = arg.underlying;
       this.orderValue = arg.orderValue;
       this.slPoints = arg.slPoints;
     }
-    // ensure underlying machine exists
     getMachine(this.symbol);
   }
 
-  /** Legacy helpers */
   sell(ltp: number, reason?: string, raw?: unknown) {
     handleSellSignal(this.symbol, ltp, reason, raw);
   }
-  buy(ltp: number, raw?: unknown) {
-    handleBuySignal(this.symbol, ltp, raw);
+  buy(ltp: number, raw?: unknown, forcedAnchor?: number) {
+    handleBuySignal(this.symbol, ltp, raw, forcedAnchor);
   }
-
-  /** webhookHandler uses this */
   onSignal(type: "BUY_SIGNAL" | "SELL_SIGNAL", ltp?: number, reason?: string, raw?: unknown) {
     const px = ltp ?? nowLtp(this.symbol) ?? 0;
-    if (type === "BUY_SIGNAL") {
-      handleBuySignal(this.symbol, px, raw);
-    } else {
-      handleSellSignal(this.symbol, px, reason, raw);
-    }
-  }
-
-  // Generic handler (kept for completeness)
-  handle(signal: Signal) {
-    getMachine(this.symbol).handleSignal(signal);
+    if (type === "BUY_SIGNAL") handleBuySignal(this.symbol, px, raw);
+    else handleSellSignal(this.symbol, px, reason, raw);
   }
 }
