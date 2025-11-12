@@ -16,7 +16,8 @@
     "express": "^5.1.0",
     "fyers-api-v3": "^1.4.2",
     "opn": "^5.5.0",
-    "uuid": "^13.0.0"
+    "uuid": "^13.0.0",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@types/express": "^5.0.5",

@@ -1,82 +1,143 @@
-// server/dataSocket.ts
-import EventEmitter from "events";
+/* server/dataSocket.ts
+ * FYERS official SDK wrapper (fyers-api-v3). Connects WS,
+ * subscribes symbols, parses ticks, forwards to onTickFromMarket().
+ *
+ * Prereq:
+ *   npm i fyers-api-v3 ws
+ */
+
+import path from "path";
+import fs from "fs";
 import { onTickFromMarket } from "./fyersClient";
 
-/**
- * Tick shape normalized for the app
- */
-export type Tick = {
-  symbol: string;
-  ltp: number;
-  ts: number; // epoch ms
-};
+// FYERS SDK is CommonJS without TS types.
+const { fyersDataSocket: DataSocket } = require("fyers-api-v3");
 
-type TickListener = (symbol: string, ltp: number, ts: number) => void;
-
-/**
- * DataSocket:
- * - Owns the broker WS connection (implement your actual FYERS WS here)
- * - Emits normalized ticks to listeners
- * - Always forwards ticks to paper broker (if PAPERTRADE=true)
- */
-class DataSocket extends EventEmitter {
-  private subscriptions = new Map<string, number>(); // symbol -> refcount
-  private connected = false;
-
-  /** Connect to broker feed (idempotent) */
-  async connect(): Promise<void> {
-    if (this.connected) return;
-    // TODO: wire your actual FYERS WS client here and call this.handleIncomingTick(...)
-    // For example:
-    // this.brokerWs.on("tick", (raw) => this.handleIncomingTick(normalize(raw)));
-    this.connected = true;
-  }
-
-  /** Subscribe to a symbol; returns an unsubscribe function */
-  async subscribe(symbol: string, listener?: TickListener): Promise<() => void> {
-    await this.connect();
-    const count = this.subscriptions.get(symbol) ?? 0;
-    this.subscriptions.set(symbol, count + 1);
-    if (listener) {
-      this.on("tick", (sym, ltp, ts) => {
-        if (sym === symbol) listener(sym, ltp, ts);
-      });
-    }
-    // TODO: if count was 0 -> send subscribe request to FYERS WS for this symbol
-    return () => this.unsubscribe(symbol, listener);
-  }
-
-  /** Unsubscribe; will unref WS symbol when refcount hits 0 */
-  unsubscribe(symbol: string, listener?: TickListener) {
-    if (listener) {
-      // remove specific bound listener (EventEmitter doesn't support predicate removal easily)
-      // Consumers that pass listener should keep their own off() if needed; we keep it simple here.
-    }
-    const count = this.subscriptions.get(symbol) ?? 0;
-    const next = Math.max(0, count - 1);
-    if (next === 0) {
-      this.subscriptions.delete(symbol);
-      // TODO: send unsubscribe request to FYERS WS for this symbol
-    } else {
-      this.subscriptions.set(symbol, next);
-    }
-  }
-
-  /** Central place to dispatch ticks to the app + paper broker */
-  private handleIncomingTick(t: Tick) {
-    // Fanout to listeners
-    this.emit("tick", t.symbol, t.ltp, t.ts);
-
-    // Always feed paper broker to simulate order fills/P&L in paper mode.
-    onTickFromMarket(t.symbol, t.ltp);
-  }
-
-  /* -----------------------------------------------------------------------
-   * Public helper if you want to inject ticks (useful for tests)
-   * ---------------------------------------------------------------------*/
-  injectTick(symbol: string, ltp: number, ts: number = Date.now()) {
-    this.handleIncomingTick({ symbol, ltp, ts });
+function ensureDir(p?: string) {
+  if (!p) return undefined;
+  const abs = path.resolve(p);
+  try {
+    fs.mkdirSync(abs, { recursive: true });
+    return abs;
+  } catch (e: any) {
+    console.warn("[dataSocket] cannot create log dir:", abs, e?.message || e);
+    return undefined;
   }
 }
 
-export const dataSocket = new DataSocket();
+function parseTickMessage(msg: any): Array<{ symbol: string; ltp: number; ts?: number }> {
+  const out: Array<{ symbol: string; ltp: number; ts?: number }> = [];
+  if (!msg) return out;
+
+  // SDK usually sends strings → parse JSON
+  if (typeof msg === "string") {
+    try { msg = JSON.parse(msg); } catch { return out; }
+  }
+
+  // Batch: { d: [ { s:"NSE:...", v:{ lp:123.4, tt: 1731300000000 } }, ... ] }
+  if (Array.isArray(msg?.d)) {
+    for (const row of msg.d) {
+      const s = row?.s || row?.symbol;
+      const lp = row?.v?.lp ?? row?.v?.ltp ?? row?.ltp ?? row?.lp;
+      const tt = row?.v?.tt ?? row?.tt;
+      if (s && lp != null && Number.isFinite(Number(lp))) {
+        out.push({ symbol: String(s), ltp: Number(lp), ts: typeof tt === "number" ? tt : undefined });
+      }
+    }
+    return out;
+  }
+
+  // Lite: { symbol:"NSE:...", ltp:123.4, ts?: 173130... }
+  if (msg?.symbol && (msg?.ltp != null || msg?.lp != null)) {
+    const s = String(msg.symbol);
+    const lp = Number(msg.ltp ?? msg.lp);
+    if (Number.isFinite(lp)) out.push({ symbol: s, ltp: lp, ts: typeof msg.ts === "number" ? msg.ts : undefined });
+    return out;
+  }
+
+  return out;
+}
+
+class FyersDataSocketWrapper {
+  private skt: any = null;
+  private connected = false;
+  private wantSymbols = new Set<string>();
+
+  async connect() {
+    const APPID = (process.env.FYERS_APP_ID || "").trim();
+    const RAW = (process.env.FYERS_ACCESS_TOKEN || "").trim();
+    if (!APPID || !RAW) {
+      console.warn("[dataSocket] FYERS_APP_ID / FYERS_ACCESS_TOKEN missing; live data will not stream.");
+      return;
+    }
+
+    const accessToken = `${APPID}:${RAW}`;
+    const logPath = ensureDir(process.env.FYERS_LOG_PATH || "");
+
+    try {
+      // Pass logPath only if available; otherwise SDK tries to write and fails
+      this.skt = logPath ? DataSocket.getInstance(accessToken, logPath) : DataSocket.getInstance(accessToken);
+    } catch (e: any) {
+      console.error("[dataSocket] getInstance error:", e?.message || e);
+      return;
+    }
+
+    this.skt.on("connect", () => {
+      this.connected = true;
+      console.log("[dataSocket] connected (FYERS SDK)");
+      if (this.wantSymbols.size) {
+        const subs = Array.from(this.wantSymbols);
+        try {
+          this.skt.subscribe(subs);
+          console.log("[dataSocket] → SUB", subs.join(", "));
+        } catch (e: any) {
+          console.error("[dataSocket] subscribe error:", e?.message || e);
+        }
+      }
+    });
+
+    this.skt.on("message", (message: any) => {
+      const ticks = parseTickMessage(message);
+      for (const t of ticks) {
+        onTickFromMarket(t.symbol, t.ltp, t.ts ?? Date.now());
+      }
+    });
+
+    this.skt.on("error", (err: any) => {
+      console.warn("[dataSocket] error:", err?.message || err);
+    });
+
+    this.skt.on("close", () => {
+      this.connected = false;
+      console.warn("[dataSocket] socket closed");
+      // SDK will reconnect if enabled
+    });
+
+    try {
+      this.skt.connect();
+      this.skt.autoreconnect();
+    } catch (e: any) {
+      console.error("[dataSocket] connect/autoreconnect error:", e?.message || e);
+    }
+  }
+
+  /** Subscribe a FYERS symbol, e.g. "NSE:NIFTY25N1125600CE" */
+  async subscribe(symbol: string) {
+    this.wantSymbols.add(symbol);
+    if (this.connected && this.skt) {
+      try {
+        this.skt.subscribe([symbol]);
+        console.log("[dataSocket] → SUB", symbol);
+      } catch (e: any) {
+        console.error("[dataSocket] subscribe error:", e?.message || e);
+      }
+    }
+  }
+
+  /** Dev/test helper used by sanity scripts */
+  injectTick(symbol: string, ltp: number, ts: number) {
+    onTickFromMarket(symbol, ltp, ts);
+  }
+}
+
+export const dataSocket = new FyersDataSocketWrapper();

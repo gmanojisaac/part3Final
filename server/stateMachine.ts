@@ -1,415 +1,294 @@
 // server/stateMachine.ts
+//
+// TradeStateMachine
+// - 60s BUY/SELL windows with single exit per window
+// - Entry TTL re-place
+// - Qty = floor(ORDER_VALUE / LTP)
+// - Mode-aware order payloads: include productType only in LIVE mode
+// - No-flip exit: exit qty equals current open position
+//
+// Env:
+//   ENTRY_TTL_MS (default 15000)
+//   ENTRY_OFFSET, EXIT_OFFSET (default 0.5)
+//   ORDER_VALUE (default 3000)
+
 import {
+  isPaper,
   getQuotesV3,
   placeLimitOrderV3,
   cancelOrderV3,
   getOrderStatusV3,
   isOrderPending,
+  getOpenQty, // ← for no-flip exit
 } from "./fyersClient";
-import { calculateQuantityForOrderValue } from "./quantityCalc";
-import { roundToTick, nowIST } from "./helpers";
-import { upsert, PersistedMachine } from "./stateStore";
 
-type State = "IDLE" | "PENDING_ENTRY" | "LONG_ACTIVE";
 type Signal = "BUY_SIGNAL" | "SELL_SIGNAL";
-type WindowDir = "BUY" | "SELL" | null;
+type Side = "BUY" | "SELL";
 
-export interface MachineConfig {
-  symbol: string;           // "NSE:NIFTY25N1125700CE"
-  underlying: string;       // "NIFTY" | "BANKNIFTY"
-  slPoints?: number;        // 0.5
-  orderValue?: number;      // ₹1L
-}
+type MachineOpts = {
+  symbol: string;      // FYERS symbol e.g. "NSE:NIFTY25N1125600CE"
+  underlying: string;  // pretty/original symbol (for logs)
+  orderValue?: number; // INR budget per entry
+  slPoints?: number;   // reserved for SL logic if you enable later
+};
 
-const ENTRY_TTL_MS = Number(process.env.ENTRY_TTL_MS ?? 15000);
-const ENTRY_OFFSET  = Number(process.env.ENTRY_OFFSET  ?? 0.5); // Buy @ LTP+0.5
-const EXIT_OFFSET   = Number(process.env.EXIT_OFFSET   ?? 0.5); // Sell @ LTP-0.5
+type WindowType = "BUY" | "SELL";
+type State = "IDLE" | "LONG_ACTIVE";
 
 export class TradeStateMachine {
-  private readonly symbol: string;
-  private readonly underlying: string;
-  private readonly slPoints: number;
-  private readonly orderValue: number;
+  symbol: string;
+  underlying: string;
 
-  private state: State = "IDLE";
-  private entryOrderId?: string;
+  state: State = "IDLE";
 
-  private savedBUYLTP: number | null = null;
-  private savedSELLLTP: number | null = null;
-  private entryRefLTP: number | null = null;
+  // RUN CONFIG
+  orderValue: number;
+  entryOffset: number;
+  exitOffset: number;
+  entryTTLms: number;
 
-  private sellStartBuyAnchor: number | null = null;
-  private pendingBuyAfterSell: boolean = false;
-  private pendingBuyAnchor: number | null = null;
+  // WINDOW
+  currentWindow: WindowType | null = null;
+  windowIdx = 0;
+  windowEndsAt = 0;
+  windowTimer: NodeJS.Timeout | null = null;
 
-  private windowDir: WindowDir = null;
-  private windowEndsAt: number | null = null;
-  private windowExited: boolean = false;
-  private buyWindowSilenced: boolean = false;
-  private buyEntriesFilledThisWindow: number = 0;
-  private buyWindowIndexSinceLastSell: number = 0;
+  // ENTRY MGMT
+  entryOrderId: string | null = null;
+  entryPlacedAt = 0;
+  fillsThisWindow = 0;
+  savedBUYLTP: number | null = null;
 
-  private exiting = false;
-  private reentryTimer: NodeJS.Timeout | null = null;
+  // EXIT MGMT
+  exitOrderId: string | null = null;
+  singleExitConsumed = false;
 
-  constructor(cfg: MachineConfig) {
-    this.symbol = cfg.symbol;
-    this.underlying = cfg.underlying.toUpperCase();
-    this.slPoints = cfg.slPoints ?? 0.5;
-    this.orderValue = cfg.orderValue ?? 100000;
+  constructor(opts: MachineOpts) {
+    this.symbol = opts.symbol;
+    this.underlying = opts.underlying;
+
+    this.orderValue = Number(process.env.ORDER_VALUE || opts.orderValue || 3000);
+    this.entryOffset = Number(process.env.ENTRY_OFFSET || 0.5);
+    this.exitOffset = Number(process.env.EXIT_OFFSET || 0.5);
+    this.entryTTLms = Number(process.env.ENTRY_TTL_MS || 15000);
+
     this.log(`[INIT] StateMachine created`);
-    this.persist();
   }
 
-  private log(msg: string) { console.log(`[${nowIST()}] [${this.symbol}] ${msg}`); }
-
-  private persist() {
-    const p: PersistedMachine & any = {
-      symbol: this.symbol,
-      underlying: this.underlying,
-      state: this.state,
-      prevSavedLTP: null,
-      buySignalAt: null,
-      reentryDeadline: this.windowEndsAt,
-      rollingActive: false,
-      cancelReentryDueToSell: false,
-      sellArmed: false,
-      sellArmRefLTP: null,
-      entryOrderId: this.entryOrderId,
-      entryRefLTP: this.entryRefLTP,
-      slPoints: this.slPoints,
-      orderValue: this.orderValue,
-
-      savedBUYLTP: this.savedBUYLTP,
-      savedSELLLTP: this.savedSELLLTP,
-      windowDir: this.windowDir,
-      windowEndsAt: this.windowEndsAt,
-      windowExited: this.windowExited,
-      buyEntriesFilledThisWindow: this.buyEntriesFilledThisWindow,
-      buyWindowSilenced: this.buyWindowSilenced,
-      sellStartBuyAnchor: this.sellStartBuyAnchor,
-      pendingBuyAfterSell: this.pendingBuyAfterSell,
-      pendingBuyAnchor: this.pendingBuyAnchor,
-      buyWindowIndexSinceLastSell: this.buyWindowIndexSinceLastSell,
-    };
-    upsert(p);
+  getState() {
+    return this.state;
   }
 
-  public static fromPersisted(p: PersistedMachine & any) {
-    const m = new TradeStateMachine({
-      symbol: p.symbol,
-      underlying: p.underlying,
-      slPoints: p.slPoints,
-      orderValue: p.orderValue,
-    });
-    (m as any).state = p.state;
-    (m as any).entryOrderId = p.entryOrderId;
-    (m as any).entryRefLTP = p.entryRefLTP;
+  /* =============== PUBLIC API =============== */
 
-    (m as any).savedBUYLTP = p.savedBUYLTP ?? null;
-    (m as any).savedSELLLTP = p.savedSELLLTP ?? null;
-
-    (m as any).windowDir = p.windowDir ?? null;
-    (m as any).windowEndsAt = p.windowEndsAt ?? null;
-    (m as any).windowExited = p.windowExited ?? false;
-    (m as any).buyEntriesFilledThisWindow = p.buyEntriesFilledThisWindow ?? 0;
-    (m as any).buyWindowSilenced = p.buyWindowSilenced ?? false;
-
-    (m as any).sellStartBuyAnchor = p.sellStartBuyAnchor ?? null;
-    (m as any).pendingBuyAfterSell = p.pendingBuyAfterSell ?? false;
-    (m as any).pendingBuyAnchor = p.pendingBuyAnchor ?? null;
-    (m as any).buyWindowIndexSinceLastSell = p.buyWindowIndexSinceLastSell ?? 0;
-
-    m.log(`[RESUME] state=${p.state}, window=${(m as any).windowDir ?? "NONE"} exitsUsed=${(m as any).windowExited ? 1 : 0}, buyIdx=${(m as any).buyWindowIndexSinceLastSell}`);
-    m.persist();
-    return m;
-  }
-
-  getState() { return this.state; }
-
-  async onSignal(sig: Signal, ltpHint?: number) {
-    const ltp = await this.ensureLTP(ltpHint);
+  async onSignal(sig: Signal) {
+    const ltp = await this.ensureLTP();
     this.log(`Signal: ${sig} @ LTP=${ltp.toFixed(2)} | state=${this.state}`);
-    if (sig === "BUY_SIGNAL") return this.onBuySignal(ltp);
-    if (sig === "SELL_SIGNAL") return this.onSellSignal(ltp);
-  }
 
-  async onTick(ltp: number) {
-    // BUY window logic (with subsequent window silencing rule)
-    if (this.windowDir === "BUY" && this.isWindowActive()) {
-      if (this.buyWindowSilenced) return;
+    if (sig === "BUY_SIGNAL") {
+      this.startBuyWindow(ltp);
+      await this.tryEnterLong(ltp);
+    } else {
+      // SELL signal
+      this.startSellWindow(ltp);
 
-      if (!this.exiting && !this.windowExited && this.state === "LONG_ACTIVE") {
-        const firstEntry = this.buyEntriesFilledThisWindow <= 1;
-        const stopThresh = firstEntry ? (this.savedBUYLTP! - this.slPoints) : (this.savedBUYLTP!);
-        if (ltp <= stopThresh) {
-          this.exiting = true;
-          this.log(`[BUY-WINDOW STOP] ltp=${ltp.toFixed(2)} <= ${stopThresh.toFixed(2)} → exit & consume window`);
-          await this.exitLong("BUY_WINDOW_STOP", ltp);
-          this.windowExited = true;
-          this.exiting = false;
-          this.persist();
-          return;
-        }
-      }
-
-      if (!this.windowExited && this.state === "IDLE") {
-        if (ltp > (this.savedBUYLTP ?? Number.POSITIVE_INFINITY - 1)) {
-          await this.enterLong(ltp);
-        }
-      }
-
-      // Subsequent BUY windows (after first SELL): silence if price < sellStartBuyAnchor
-      if (this.buyWindowIndexSinceLastSell >= 2 && this.sellStartBuyAnchor != null) {
-        if (ltp < this.sellStartBuyAnchor) {
-          this.savedBUYLTP = this.sellStartBuyAnchor;
-          this.pendingBuyAfterSell = false;
-          this.buyWindowSilenced = true;
-          this.log(`[BUY WINDOW SILENCE] ltp ${ltp.toFixed(2)} < sellStartBuyAnchor ${this.sellStartBuyAnchor.toFixed(2)} → savedBUYLTP=${this.savedBUYLTP.toFixed(2)}; silence until window ends`);
-          this.persist();
-          return;
-        }
+      if (this.state === "LONG_ACTIVE") {
+        // Immediate exit if holding a long (no flip)
+        await this.exitLongImmediate(ltp);
+      } else {
+        // No position → SELL window just defers a BUY window after it ends
       }
     }
-
-    // SELL window is passive during ticks (we defer BUY switch to window end)
   }
 
-  // ---- Signals
-  private async onBuySignal(ltp: number) {
-    // First BUY after SELL: clear pending flag; set anchor if missing
-    this.pendingBuyAfterSell = false;
-    if (this.sellStartBuyAnchor == null) this.sellStartBuyAnchor = ltp;
+  /* =============== WINDOWS =============== */
 
-    await this.startBuyWindow(ltp);
-  }
-
-  private async onSellSignal(ltp: number) {
-    this.closeWindow();
-    this.windowDir = "SELL";
+  private startBuyWindow(ltp: number) {
+    this.windowIdx += 1;
+    this.currentWindow = "BUY";
     this.windowEndsAt = Date.now() + 60_000;
-    this.windowExited = false;
+    this.fillsThisWindow = 0;
+    this.savedBUYLTP = ltp;
+    this.singleExitConsumed = false;
 
-    this.sellStartBuyAnchor = ltp;
-    this.savedSELLLTP = ltp;
-
-    this.pendingBuyAfterSell = true;
-    this.pendingBuyAnchor = ltp;
-
-    this.buyWindowIndexSinceLastSell = 0;
-
-    this.log(
-      `[SELL WINDOW] start 60s until ${new Date(this.windowEndsAt).toLocaleTimeString("en-GB",{ timeZone: "Asia/Kolkata" })} | anchor=${ltp.toFixed(2)} (BUY deferred to end)`
-    );
-
-    // Immediate exit if in trade, but stay in SELL window
-    if (this.state === "LONG_ACTIVE" || this.state === "PENDING_ENTRY") {
-      this.log(`[SELL WINDOW] active position → immediate exit @ (ltp-0.5); BUY window will start after SELL window ends`);
-      await this.exitLong("SELL_WINDOW_IMMEDIATE_EXIT", ltp);
-    }
-
+    this.log(`[BUY WINDOW] start 60s (idx=${this.windowIdx}) until ${this.ts(this.windowEndsAt)} | savedBUYLTP=${ltp.toFixed(2)}`);
     this.armWindowTimer();
-    this.persist();
   }
 
-  // ---- BUY window creation
-  private async startBuyWindow(anchorLtp: number) {
-    this.closeWindow();
-    this.windowDir = "BUY";
+  private startSellWindow(ltp: number) {
+    this.currentWindow = "SELL";
     this.windowEndsAt = Date.now() + 60_000;
-    this.windowExited = false;
-    this.buyEntriesFilledThisWindow = 0;
-    this.buyWindowSilenced = false;
-    this.savedBUYLTP = anchorLtp;
 
-    this.buyWindowIndexSinceLastSell += 1;
-
-    this.log(
-      `[BUY WINDOW] start 60s (idx=${this.buyWindowIndexSinceLastSell}) until ${new Date(this.windowEndsAt).toLocaleTimeString("en-GB",{ timeZone: "Asia/Kolkata" })} | savedBUYLTP=${anchorLtp.toFixed(2)}`
-    );
-
-    if (this.state === "IDLE") {
-      await this.enterLong(anchorLtp);
-    }
-
+    this.log(`[SELL WINDOW] start 60s until ${this.ts(this.windowEndsAt)} | anchor=${ltp.toFixed(2)} (BUY deferred to end)`);
     this.armWindowTimer();
-    this.persist();
   }
 
-  // ---- Orders
-  private async enterLong(ltp: number) {
-    if (!this.isWindowActive()) { this.log(`[ENTER LONG] blocked — no active window`); return; }
-    if (this.windowExited) { this.log(`[ENTER LONG] blocked — window exit already consumed`); return; }
-    if (this.windowDir === "BUY" && this.buyWindowSilenced) { this.log(`[ENTER LONG] blocked — BUY window silenced`); return; }
-    if (this.state !== "IDLE") { this.log(`[ENTER LONG] ignored — state=${this.state}`); return; }
-
-    const qty = calculateQuantityForOrderValue(this.underlying, ltp, this.orderValue);
-    this.entryRefLTP = ltp;
-    const buyLimit = roundToTick(ltp + ENTRY_OFFSET);
-    this.log(`[ENTER LONG] window=${this.windowDir} nextFill=${this.buyEntriesFilledThisWindow + 1} qty=${qty}, LIMIT=${buyLimit}, LTP=${ltp}`);
-
-    const entry = await placeLimitOrderV3({
-      symbol: this.symbol,
-      side: "BUY",
-      qty,
-      limitPrice: buyLimit,
-      productType: "INTRADAY",
-      validity: "DAY",
-    });
-
-    this.entryOrderId = entry?.id;
-    this.state = "PENDING_ENTRY";
-    this.persist();
-
-    setTimeout(async () => {
-      if (this.state !== "PENDING_ENTRY" || !this.entryOrderId) return;
-
-      if (!this.isWindowActive() || this.windowExited || (this.windowDir === "BUY" && this.buyWindowSilenced)) {
-        this.log(`[ENTRY TTL] window not active/consumed/silenced → cancel pending and stop`);
-        await cancelOrderV3(this.entryOrderId);
-        this.entryOrderId = undefined;
-        this.state = "IDLE";
-        this.persist();
-        return;
-      }
-
-      try {
-        const st = await getOrderStatusV3(this.entryOrderId);
-        if (st.found && !isOrderPending(st.status)) {
-          this.log(`[ENTRY TTL] status=${st.status} → no re-place`);
-          if (String(st.status).toUpperCase() === "FILLED") this.onEntryFilled();
-          return;
-        }
-      } catch {}
-
-      this.log(`[ENTRY TTL] cancelling stale entry ${this.entryOrderId} and (maybe) re-placing...`);
-      const cancelRes: any = await cancelOrderV3(this.entryOrderId);
-      const notPending = cancelRes?.code === -52;
-      if (notPending) {
-        this.log(`[ENTRY TTL] cancel says not pending → skip re-place`);
-        return;
-      }
-      this.entryOrderId = undefined;
-
-      if (!this.isWindowActive() || this.windowExited || (this.windowDir === "BUY" && this.buyWindowSilenced)) {
-        this.log(`[ENTRY TTL] window changed/consumed/silenced → skip re-place`);
-        this.state = "IDLE";
-        this.persist();
-        return;
-      }
-
-      const nowLtp = await this.ensureLTP();
-      const newQty = calculateQuantityForOrderValue(this.underlying, nowLtp, this.orderValue);
-      const newLim = roundToTick(nowLtp + ENTRY_OFFSET);
-
-      const re = await placeLimitOrderV3({
-        symbol: this.symbol,
-        side: "BUY",
-        qty: newQty,
-        limitPrice: newLim,
-        productType: "INTRADAY",
-        validity: "DAY",
-      });
-      this.entryOrderId = re?.id;
-      this.log(`[ENTRY TTL] re-placed entry order=${this.entryOrderId} @ limit=${newLim}`);
-      this.persist();
-    }, ENTRY_TTL_MS);
-  }
-
-  public onEntryFilled() {
-    if (this.state === "PENDING_ENTRY") {
-      this.state = "LONG_ACTIVE";
-      this.buyEntriesFilledThisWindow += 1;
-      this.log(`[FILL] Entry filled → LONG_ACTIVE (fills this window=${this.buyEntriesFilledThisWindow})`);
-      this.persist();
-    }
-  }
-
-  private async exitLong(reason: string, ltpNow?: number) {
-    const ltp = await this.ensureLTP(ltpNow);
-    const qty = calculateQuantityForOrderValue(this.underlying, ltp, this.orderValue);
-    const sellLimit = roundToTick(ltp - EXIT_OFFSET);
-
-    this.log(`[EXIT LONG] reason=${reason}, qty=${qty}, limit=${sellLimit}, LTP=${ltp}`);
-    try {
-      await placeLimitOrderV3({
-        symbol: this.symbol,
-        side: "SELL",
-        qty,
-        limitPrice: sellLimit,
-        productType: "INTRADAY",
-        validity: "DAY",
-      });
-    } catch (e) {
-      this.log(`Exit error: ${(e as Error).message}`);
-    }
-
-    await this.cancelOpenEntryIfTracked();
-    this.entryRefLTP = null;
-    this.state = "IDLE";
-    this.persist();
-  }
-
-  // ---- window helpers
   private armWindowTimer() {
-    if (this.reentryTimer) clearTimeout(this.reentryTimer);
-    const ms = Math.max(0, (this.windowEndsAt ?? Date.now()) - Date.now());
-    this.reentryTimer = setTimeout(() => this.onWindowEnd(), ms);
+    if (this.windowTimer) clearTimeout(this.windowTimer);
+    const ms = Math.max(0, this.windowEndsAt - Date.now());
+    this.windowTimer = setTimeout(() => this.onWindowEnd(), ms);
   }
 
   private async onWindowEnd() {
-    this.reentryTimer = null;
-    const endedDir = this.windowDir;
-    this.log(`[WINDOW END] ${endedDir ?? "NONE"} window ended`);
+    this.log(`[WINDOW END] ${this.currentWindow} window ended`);
 
-    // SELL → deferred BUY
-    if (endedDir === "SELL" && this.pendingBuyAfterSell && this.pendingBuyAnchor != null) {
-      const anchor = this.pendingBuyAnchor;
-      this.pendingBuyAfterSell = false;
-      this.pendingBuyAnchor = null;
-      await this.startBuyWindow(anchor);
+    const ended = this.currentWindow;
+    this.currentWindow = null;
+    this.entryOrderId = null; // safety
+    this.exitOrderId = null;
+
+    if (ended === "SELL") {
+      // Auto-start a BUY window after SELL window ends
+      const ltp = await this.ensureLTP();
+      this.startBuyWindow(ltp);
+      await this.tryEnterLong(ltp);
+    }
+  }
+
+  /* =============== ENTRY / EXIT =============== */
+
+  private computeQty(ltp: number): number {
+    const raw = Math.floor(this.orderValue / Math.max(1, Math.round(ltp)));
+    return Math.max(1, raw);
+  }
+
+  private async tryEnterLong(ltp: number) {
+    if (this.currentWindow !== "BUY") return;
+
+    const qty = this.computeQty(ltp);
+    const buyLimit = Number((ltp + this.entryOffset).toFixed(2));
+
+    this.log(`[ENTER LONG] window=BUY nextFill=${this.fillsThisWindow + 1} qty=${qty}, LIMIT=${buyLimit}, LTP=${ltp}`);
+
+    const req = {
+      symbol: this.symbol,
+      side: "BUY" as const,
+      qty,
+      limitPrice: buyLimit,
+      ...(isPaper() ? {} : { productType: "INTRADAY" }),
+    };
+
+    const entry = await placeLimitOrderV3(req);
+    this.entryOrderId = entry?.id || null;
+    this.entryPlacedAt = Date.now();
+
+    // arm TTL watcher
+    setTimeout(() => this.checkEntryTTL(), this.entryTTLms);
+  }
+
+  private async checkEntryTTL() {
+    if (!this.entryOrderId) return;
+    const id = this.entryOrderId;
+
+    try {
+      const st = await getOrderStatusV3(id);
+      if (!st.found) return;
+      if (!isOrderPending(st.status)) {
+        this.log(`[ENTRY TTL] status=${(st as any).status || st} → no re-place`);
+        if (String((st as any).status || st).toUpperCase() === "FILLED") this.onEntryFilled();
+        return;
+      }
+    } catch {
+      // ignore; will try to re-place optimistically
+    }
+
+    // cancel & re-place at fresh limit
+    this.log(`[ENTRY TTL] cancelling stale entry ${id} and (maybe) re-placing...`);
+    try { await cancelOrderV3(id); } catch {}
+    this.entryOrderId = null;
+
+    // Respect window still open
+    if (this.currentWindow !== "BUY") return;
+
+    const ltp = await this.ensureLTP();
+    const qty = this.computeQty(ltp);
+    const newLimit = Number((ltp + this.entryOffset).toFixed(2));
+
+    const re = await placeLimitOrderV3({
+      symbol: this.symbol,
+      side: "BUY",
+      qty,
+      limitPrice: newLimit,
+      ...(isPaper() ? {} : { productType: "INTRADAY" }),
+    });
+    this.entryOrderId = re?.id || null;
+    this.log(`[ENTRY TTL] re-placed entry order=${this.entryOrderId} @ limit=${newLimit}`);
+  }
+
+  private onEntryFilled() {
+    this.fillsThisWindow += 1;
+    this.state = "LONG_ACTIVE";
+    this.log(`[FILL] Entry filled → LONG_ACTIVE (fills this window=${this.fillsThisWindow})`);
+  }
+
+  private async exitLongImmediate(ltp: number) {
+    if (this.state !== "LONG_ACTIVE") return;
+
+    // Exact open qty → no flip
+    const openQty = Math.abs(getOpenQty(this.symbol));
+    if (openQty <= 0) {
+      this.log(`[SELL WINDOW] requested exit but already flat → skipping`);
       return;
     }
 
-    // BUY window ended while silenced → auto new BUY window with current savedBUYLTP
-    if (endedDir === "BUY" && this.buyWindowSilenced) {
-      const anchor = this.savedBUYLTP ?? (await this.ensureLTP());
-      this.buyWindowSilenced = false;
-      await this.startBuyWindow(anchor);
-      return;
-    }
+    const sellLimit = Number((ltp - this.exitOffset).toFixed(2));
+    const qty = openQty;
 
-    this.closeWindow();
-    this.persist();
-  }
+    this.log(`[SELL WINDOW] active position → immediate exit @ (ltp-${this.exitOffset}); BUY window will start after SELL window ends`);
 
-  private closeWindow() {
-    this.windowDir = null;
-    this.windowEndsAt = null;
-    this.windowExited = false;
-    this.buyEntriesFilledThisWindow = 0;
-    if (this.reentryTimer) clearTimeout(this.reentryTimer);
-    this.reentryTimer = null;
-  }
+    const ex = await placeLimitOrderV3({
+      symbol: this.symbol,
+      side: "SELL",
+      qty,
+      limitPrice: sellLimit,
+      ...(isPaper() ? {} : { productType: "INTRADAY" }),
+    });
+    this.exitOrderId = ex?.id || null;
 
-  private isWindowActive() {
-    return this.windowDir != null && this.windowEndsAt != null && Date.now() <= this.windowEndsAt;
-  }
+    this.log(`[EXIT LONG] reason=SELL_WINDOW_IMMEDIATE_EXIT, qty=${qty}, limit=${sellLimit}, LTP=${ltp}`);
 
-  private async ensureLTP(pref?: number): Promise<number> {
-    if (pref && pref > 0) return pref;
-    const q = await getQuotesV3([this.symbol]);
-    const l = q?.d?.[0]?.v?.lp;
-    if (!l) throw new Error(`LTP not found for ${this.symbol}`);
-    return l;
-  }
-
-  private async cancelOpenEntryIfTracked() {
+    // Cancel any stale entry still around
     if (this.entryOrderId) {
       this.log(`Cancelling entry order id=${this.entryOrderId}`);
-      await cancelOrderV3(this.entryOrderId);
-      this.entryOrderId = undefined;
-      this.persist();
+      try { await cancelOrderV3(this.entryOrderId); } catch {}
+      this.entryOrderId = null;
     }
+    this.singleExitConsumed = true;
+  }
+
+  // Kept for future use; now prefers exact open qty.
+  private computeQtyFromPnLContext(): number {
+    const openQty = Math.abs(getOpenQty(this.symbol));
+    if (openQty > 0) return openQty;
+    return this.computeQty(Math.max(1, this._lastKnownLTP || 1));
+  }
+
+  /* =============== LTP / QUOTES =============== */
+
+  private _lastKnownLTP: number | null = null;
+
+  private async ensureLTP(): Promise<number> {
+    const q = await getQuotesV3(this.symbol);
+    const l = (q as any)?.d?.[0]?.v?.lp;
+    if (l == null || !Number.isFinite(Number(l))) {
+      throw new Error(`LTP not found for ${this.symbol}`);
+    }
+    this._lastKnownLTP = Number(l);
+    return Number(l);
+  }
+
+  /* =============== UTIL =============== */
+
+  private ts(ms: number) {
+    const d = new Date(ms);
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+
+  log(msg: string) {
+    const d = new Date();
+    const p = (n: number) => String(n).padStart(2, "0");
+    const hhmmss = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    console.log(`[${hhmmss}] [${this.symbol}] ${msg}`);
   }
 }

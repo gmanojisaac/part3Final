@@ -1,37 +1,53 @@
 // server/symbolFormat.ts
-// Convert from webhook "NIFTY251111C25000" etc. to FYERS symbols:
-// NIFTY -> NIFTY25N11<strike>CE  (YY M(D=1..31) Day? In Fyers options it's DD + month code)
-// BANKNIFTY -> BANKNIFTY25NOV<strike>CE
 
-const MONTH_CODE = ["", "F", "G", "H", "J", "K", "M", "N", "Q", "U", "V", "X"]; // Fyers short? We used 'N' for Nov (given by you)
-const MON_FULL = ["", "JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+export type ParsedWebhookSym = {
+  root: "NIFTY" | "BANKNIFTY";
+  yy: string; // "25"
+  mm: string; // "11"
+  dd: string; // "18"
+  cp: "C" | "P";
+  strike: string; // "25650"
+};
 
-export function parseWebhookSym(s: string) {
-  // Examples:
-  // NIFTY251111C25000 → underlying=NIFTY, yy=25, mm=11, dd=11, C/P, strike=25000
-  // BANKNIFTY251125C59500
-  const m = s.match(/^(NIFTY|BANKNIFTY)(\d{2})(\d{2})(\d{2})([CP])(\d+)$/i);
-  if (!m) throw new Error(`Unrecognized sym: ${s}`);
-  const underlying = m[1].toUpperCase();
+const MONTH_LETTER: Record<string, string> = {
+  "01": "A", // Jan
+  "02": "F", // Feb
+  "03": "M", // Mar
+  "04": "A", // Apr
+  "05": "M", // May
+  "06": "J", // Jun
+  "07": "J", // Jul
+  "08": "A", // Aug
+  "09": "S", // Sep
+  "10": "O", // Oct
+  "11": "N", // Nov
+  "12": "D", // Dec
+};
+
+const RE = /\b(NIFTY|BANKNIFTY)(\d{2})(\d{2})(\d{2})([CP])(\d+)\b/i;
+
+export function parseWebhookSym(raw: string): { fyers: string; underlying: "NIFTY" | "BANKNIFTY" } {
+  const m = raw.trim().toUpperCase().match(RE);
+  if (!m) throw new Error(`symbolFormat: cannot parse "${raw}"`);
+
+  const root = m[1] as "NIFTY" | "BANKNIFTY";
   const yy = m[2];
-  const mm = Number(m[3]);
+  const mm = m[3];
   const dd = m[4];
-  const cp = m[5].toUpperCase();
+  const cp = m[5] as "C" | "P";
   const strike = m[6];
 
-  if (underlying === "NIFTY") {
-    // NIFTY25N1125000CE (YY M(Day)?? per your mapping we used "N" for November and day DD)
-    const monLetter = "FGHJKMNQUVX"[mm - 1] || "N"; // fallback N
-    return {
-      fyers: `NSE:NIFTY${yy}${monLetter}${dd}${strike}${cp}E`,
-      underlying,
-    };
-  } else {
-    // BANKNIFTY25NOV59500CE (YY MON strike CE)
-    const mon = MON_FULL[mm];
-    return {
-      fyers: `NSE:BANKNIFTY${yy}${mon}${strike}${cp}E`,
-      underlying,
-    };
-  }
+  const mon = MONTH_LETTER[mm];
+  if (!mon) throw new Error(`symbolFormat: unknown month "${mm}" in "${raw}"`);
+
+  const suffix = cp === "C" ? "CE" : "PE";
+  const fyers = `NSE:${root}${yy}${mon}${dd}${strike}${suffix}`;
+
+  return { fyers, underlying: root };
+}
+
+/** Back-compat helper */
+export function formatSymbol(raw: string) {
+  const { fyers, underlying } = parseWebhookSym(raw);
+  return { fySymbol: fyers, underlying };
 }
