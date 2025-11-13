@@ -46,7 +46,7 @@ type PerSymbolAnchorState = {
   // Current BUY anchor used by BUY window
   savedBUYLTP: number | null;
 
-  // Last "important" BUY anchor you care about for re-entry
+  // Last "important" BUY anchor for re-entry / SELL re-check
   savedLastBUYLTP: number | null;
 
   // Mark that the next BUY is first after SELL (optional, kept for extensibility)
@@ -363,6 +363,8 @@ class SymbolMachine {
    *
    * - Stop-out: tick < (anchor - 0.5) → exit full, go IDLE, silence until window end.
    * - Flat breakout: flat & tick > anchor → buy @ (tick + 0.5), start a fresh 60s BUY window.
+   * - Timeout: if FLAT & LTP > anchor → treat as breakout-at-timeout (auto BUY + new BUY window),
+   *            else → go IDLE.
    */
   private startBuyWindow(anchor: number) {
     const a = ensureAnchor(this.sym);
@@ -445,7 +447,33 @@ class SymbolMachine {
     this.buyWindowTimer = setTimeout(() => {
       this.buyWindowTimer = null;
       this.buyWindowActive = false;
+
+      const anchorPx = a.savedBUYLTP ?? anchor;
       this.buySilenceUntil = null; // clear any stop-out silence
+
+      const ltpNow = nowLtp(this.sym) ?? anchorPx;
+      const flat = getOpenQty(this.sym) === 0;
+
+      // NEW LOGIC: if FLAT and LTP > savedBUYLTP at timeout → auto re-arm BUY
+      if (flat && ltpNow > anchorPx) {
+        const qty2 = computeQtyFromPnLContext(this.sym);
+        const px = roundPrice(ltpNow + 0.5);
+        debug(
+          this.sym,
+          `[BUY TIMEOUT BREAKOUT] flat & LTP=${fmtPx(
+            ltpNow
+          )} > savedBUYLTP=${fmtPx(
+            anchorPx
+          )} → place BUY LIMIT qty=${qty2} @ ${fmtPx(px)} and start new BUY window`
+        );
+        placeLimitBuy(this.sym, qty2, px, { tag: "BUY_TIMEOUT_BREAKOUT_REENTER" });
+
+        this.state = "IDLE"; // startBuyWindow will set to IN_BUY_WINDOW
+        this.startBuyWindow(anchorPx);
+        return;
+      }
+
+      // Otherwise → plain timeout to IDLE
       this.state = "IDLE";
       log(this.sym, "[BUY WINDOW] window ended → IDLE");
     }, windowMs);
