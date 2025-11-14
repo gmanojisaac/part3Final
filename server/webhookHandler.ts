@@ -1,28 +1,54 @@
 /* eslint-disable no-console */
 
-import { TradeStateMachine } from "./stateMachine";
+import { handleBuySignal, handleSellSignal } from "./stateMachine";
 import { getQuotesV3, isPaper } from "./fyersClient";
 import { isMarketOpen, marketClock } from "./marketHours";
 import { ensureSubscribed, onSymbolTick, nowLtp } from "./dataSocket";
 
-// If you already have a richer mapper, swap this with your real one.
+/**
+ * Map TradingView-style symbol → Fyers symbol.
+ *
+ * Example:
+ *   Input : NIFTY251118C25850
+ *   Output: NSE:NIFTY25N1825850CE
+ */
 function mapToFyersSymbol(human: string): string {
-  // Example: NIFTY251118C25850 -> NSE:NIFTY25N1825850CE
-  // Keep your real implementation if you have one.
   const m = /^NIFTY(\d{2})(\d{2})(\d{2})([CP])(\d+)$/.exec(human);
-  if (!m) return human.startsWith("NSE:") ? human : `NSE:${human}`;
-  const [_, yy, mm, dd, cp, strike] = m;
+  if (!m) {
+    // Fallback: if it already looks like a Fyers symbol, just prefix NSE: if needed
+    return human.startsWith("NSE:") ? human : `NSE:${human}`;
+  }
+
+  const [, yy, mm, dd, cp, strike] = m;
+
   const monthMap: Record<string, string> = {
-    "01": "J", "02": "F", "03": "M", "04": "A", "05": "M", "06": "J",
-    "07": "J", "08": "A", "09": "S", "10": "O", "11": "N", "12": "D",
+    "01": "J",
+    "02": "F",
+    "03": "M",
+    "04": "A",
+    "05": "M",
+    "06": "J",
+    "07": "J",
+    "08": "A",
+    "09": "S",
+    "10": "O",
+    "11": "N",
+    "12": "D",
   };
-  const monCode = monthMap[mm] ?? "N";
+
+  const monCode = monthMap[mm] ?? "N"; // default N if unknown month
   const cepe = cp === "C" ? "CE" : "PE";
-  return `NSE:NIFTY${yy}${monCode}${dd}${strike}${cepe}`;
+
+  // ✅ Use full 2-digit year: "25" + "N" + "18" = "25N18"
+  const expiryCode = `${yy}${monCode}${dd}`;
+
+  // Final symbol: NSE:NIFTY25N1825950PE
+  return `NSE:NIFTY${expiryCode}${strike}${cepe}`;
 }
 
-// Parse a simple plaintext payload like the ones in your logs.
-// e.g. "upCEAccepted Exit + priorRisePct= 0.00 | stopPx=168.50 | sym=NIFTY251118C25850"
+// Parse the webhook body text from TradingView / your alerts.
+// Example payload:
+//   "Accepted Entry + priorRisePct= 0.00 | stopPx=168.50 | sym=NIFTY251118P25950"
 function parseWebhook(text: string): {
   side: "BUY" | "SELL";
   stopPx?: number;
@@ -30,11 +56,15 @@ function parseWebhook(text: string): {
   raw: string;
 } {
   const raw = text;
+
+  // Heuristic: if it mentions "side=SELL" or "Exit" → SELL, else BUY
   const side: "BUY" | "SELL" = /side=SELL|Exit/i.test(text) ? "SELL" : "BUY";
+
   const stopMatch = /stopPx\s*=\s*([0-9.]+)/i.exec(text);
   const symMatch =
     /sym\s*=\s*([A-Z0-9:._-]+)/i.exec(text) ||
     /symbol\s*=\s*([A-Z0-9:._-]+)/i.exec(text);
+
   return {
     side,
     stopPx: stopMatch ? Number(stopMatch[1]) : undefined,
@@ -90,12 +120,12 @@ async function getLtpWithFallback(
   // 4) fallback
   if (opts.fallbackPx != null) {
     console.warn(
-      `[webhookHandler] LTP not received for ${symbol} within ${timeoutMs}ms — using fallback ${opts.fallbackPx}`
+      `[webhookHandler] No live LTP for ${symbol} within ${timeoutMs}ms, using fallbackPx=${opts.fallbackPx}`
     );
     return opts.fallbackPx;
   }
 
-  // no fallback → throw (old behavior)
+  // no fallback → throw
   throw new Error(
     `LTP not found for ${symbol} within ${timeoutMs}ms (waiting for live tick).`
   );
@@ -125,23 +155,15 @@ export async function handleWebhookText(text: string) {
     fallbackPx: parsed.stopPx, // use stopPx if no tick arrives in time
   });
 
-  // Construct machine (your legacy ctor passes a config object)
-  const m = new TradeStateMachine({
-    symbol: fyersSymbol,
-    underlying: "NIFTY", // optional if you want it
-    orderValue: Number(process.env.ORDER_VALUE || 0),
-    slPoints: Number(process.env.SL_POINTS || 0.5),
-  });
-
-  // Fire signal the way your legacy code expects
+  // Route signal into shared per-symbol state machine
   if (parsed.side === "BUY") {
-    await m.onSignal("BUY_SIGNAL", ltp, undefined, { source: "webhook" });
+    await handleBuySignal(fyersSymbol, ltp, parsed.raw);
   } else {
-    await m.onSignal("SELL_SIGNAL", ltp, "EXIT_ONLY", { source: "webhook" });
+    await handleSellSignal(fyersSymbol, ltp, "EXIT_ONLY", parsed.raw);
   }
 }
 
-// (Optional) expose a tiny status helper if your server wants it
+// Optional: expose a tiny status helper if your server wants it
 export function webhookStatus() {
   const clock = marketClock();
   return {
