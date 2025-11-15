@@ -12,7 +12,7 @@ import bodyParser from "body-parser";
 
 import { handleWebhookText, webhookStatus } from "./webhookHandler";
 import { dataSocket } from "./dataSocket"; // ensures sockets get initialized
-import { getPnL, isPaper, getTrades } from "./fyersClient";
+import { getPnL, isPaper } from "./fyersClient";
 import { marketClock } from "./marketHours";
 import { getRelays, relayToAll } from "./relayStore";
 
@@ -40,7 +40,9 @@ app.post("/webhook", async (req, res) => {
     res.json({ ok: true, result });
   } catch (err: any) {
     console.error("[/webhook] ERROR:", err);
-    res.status(500).json({ ok: false, error: err?.message ?? String(err) });
+    res
+      .status(500)
+      .json({ ok: false, error: err?.message ?? String(err) });
   }
 });
 
@@ -58,11 +60,6 @@ app.get("/pnl", (_req, res) => {
   res.json(getPnL());
 });
 
-// Trades JSON
-app.get("/trades", (_req, res) => {
-  res.json({ trades: getTrades() });
-});
-
 // Relays JSON
 app.get("/relays", (_req, res) => {
   res.json({ relays: getRelays() });
@@ -76,7 +73,9 @@ app.post("/relay-test", async (req, res) => {
     const result = await relayToAll(payload);
     res.json({ ok: true, result });
   } catch (err: any) {
-    res.status(500).json({ ok: false, error: err?.message ?? String(err) });
+    res
+      .status(500)
+      .json({ ok: false, error: err?.message ?? String(err) });
   }
 });
 
@@ -234,102 +233,6 @@ app.get("/pnl-ui", (_req, res) => {
 </html>`);
 });
 
-// Trades UI
-app.get("/trades-ui", (_req, res) => {
-  res.type("html").send(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Executed Trades</title>
-  <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; }
-    h1 { margin-bottom: 1rem; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: right; }
-    th { background: #f0f0f0; }
-    td.sym, th.sym { text-align: left; }
-    td.buy { color: #0a0; font-weight: bold; }
-    td.sell { color: #c00; font-weight: bold; }
-    td.pnl-pos { color: #0a0; }
-    td.pnl-neg { color: #c00; }
-    pre { background:#111; color:#0f0; padding:12px; border-radius:6px; margin-top:16px; }
-  </style>
-</head>
-
-<body>
-  <h1>Trades Executed</h1>
-
-  <table id="trade-table">
-    <thead>
-      <tr>
-        <th>Time</th>
-        <th class="sym">Symbol</th>
-        <th>Side</th>
-        <th>Qty</th>
-        <th>Price</th>
-        <th>P&amp;L</th>
-        <th>P&amp;L Total</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  </table>
-
-  <pre id="raw"></pre>
-
-  <script>
-    function fmt(x) {
-      if (typeof x !== 'number') return x;
-      return x.toFixed(2);
-    }
-
-    function clsPnL(v) {
-      if (v > 0) return 'pnl-pos';
-      if (v < 0) return 'pnl-neg';
-      return '';
-    }
-
-    async function refresh() {
-      try {
-        const res = await fetch('/trades');
-        const data = await res.json();
-        const trades = data.trades || [];
-
-        const tbody = document.querySelector('#trade-table tbody');
-        tbody.innerHTML = '';
-
-        let running = 0;
-
-        trades.forEach(t => {
-          running += (t.realized || 0);
-
-          const tr = document.createElement('tr');
-
-          tr.innerHTML =
-            '<td>' + (t.ts ? new Date(t.ts).toLocaleTimeString() : '') + '</td>' +
-            '<td class="sym">' + t.sym + '</td>' +
-            '<td class="' + (t.side === 'BUY' ? 'buy' : 'sell') + '">' + t.side + '</td>' +
-            '<td>' + t.qty + '</td>' +
-            '<td>' + fmt(t.price) + '</td>' +
-            '<td class="' + clsPnL(t.realized) + '">' + fmt(t.realized) + '</td>' +
-            '<td class="' + clsPnL(running) + '">' + fmt(running) + '</td>';
-
-          tbody.appendChild(tr);
-        });
-
-        document.getElementById('raw').textContent = JSON.stringify(data, null, 2);
-      } catch (e) {
-        document.getElementById('raw').textContent = 'Error loading trades: ' + e;
-      }
-    }
-
-    refresh();
-    setInterval(refresh, 5000);
-  </script>
-
-</body>
-</html>`);
-});
-
 // Relays UI
 app.get("/relays-ui", (_req, res) => {
   res.type("html").send(`<!doctype html>
@@ -435,7 +338,6 @@ app.get("/", (_req, res) => {
     <li><a href="/pnl-ui">PnL UI</a></li>
     <li><a href="/relays-ui">Relays UI</a></li>
     <li><a href="/market-ui">Market Clock</a></li>
-    <li><a href="/trades-ui">Trades Executed</a></li>
   </ul>
 </body>
 </html>`);
@@ -446,7 +348,7 @@ app.get("/", (_req, res) => {
 // ---------------------------------------------------------------------------
 app.listen(PORT, () => {
   console.log(
-    `[server] Listening on ${PORT} (papertrade=${isPaper()}) — relay UI at http://localhost:${PORT}/relays-ui  |  status UI at /status-ui  |  pnl UI at /pnl-ui  |  trades UI at /trades-ui`
+    `[server] Listening on ${PORT} (papertrade=${isPaper()}) — relay UI at http://localhost:${PORT}/relays-ui  |  status UI at /status-ui  |  pnl UI at /pnl-ui`
   );
 
   // Touch dataSocket so it initializes (if it has side-effects on import)

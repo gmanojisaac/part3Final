@@ -36,7 +36,9 @@ export async function connect(): Promise<void> {
 /** Called by your socket bootstrap when connection state changes */
 export function setSocketConnected(connected: boolean) {
   socketConnected = connected;
-  console.log(`[dataSocket] ${connected ? "connected (FYERS SDK)" : "socket closed"}`);
+  console.log(
+    `[dataSocket] ${connected ? "connected (FYERS v3 WS)" : "socket closed"}`
+  );
 }
 
 /** Push raw ticks into the hub (call this from your SDK onTick) */
@@ -55,15 +57,22 @@ export function ingestSdkTick(symbol: string, ltp: number, raw?: unknown) {
   }
 }
 
-/** Return latest known LTP (or null if we have none yet) */
-export function nowLtp(symbol: string): number | null {
-  return LAST_LTP.get(symbol)?.ltp ?? null;
+/** Ensure upstream WS is subscribed to this symbol. */
+export function ensureSubscribed(symbol: string) {
+  if (SUBSCRIBED.has(symbol)) return;
+  SUBSCRIBED.add(symbol);
+
+  if (!socketConnected) {
+    console.warn(
+      `[dataSocket] ensureSubscribed(${symbol}) but socket not connected yet`
+    );
+  }
+
+  console.log(`[dataSocket] → SUB ${symbol}`);
+  subscribeSymbols([symbol]);
 }
 
-/**
- * Register a per-symbol tick callback.
- * Returns an unsubscribe function.
- */
+/** Register a listener for LTP ticks of a symbol. Returns an unsubscribe fn. */
 export function onSymbolTick(symbol: string, cb: TickHandler): () => void {
   let set = LISTENERS.get(symbol);
   if (!set) {
@@ -80,85 +89,30 @@ export function onSymbolTick(symbol: string, cb: TickHandler): () => void {
   // Emit cached LTP immediately if available.
   const cached = LAST_LTP.get(symbol);
   if (cached) {
-    setTimeout(() => {
-      try {
-        cb(cached.ltp);
-      } catch {
-        /* ignore */
-      }
-    }, 0);
+    try {
+      cb(cached.ltp);
+    } catch (err) {
+      console.error(
+        `[dataSocket] immediate listener error for ${symbol}:`,
+        err
+      );
+    }
   }
 
   return () => {
     const s = LISTENERS.get(symbol);
     if (!s) return;
     s.delete(cb);
+    if (s.size === 0) {
+      LISTENERS.delete(symbol);
+      // NOTE: we do not auto-unsubscribe upstream; simple model for now.
+    }
   };
 }
 
-/** Ask the upstream SDK to subscribe (idempotent) */
-export function ensureSubscribed(symbol: string) {
-  if (SUBSCRIBED.has(symbol)) return;
-  SUBSCRIBED.add(symbol);
-  console.log(`[dataSocket] → SUB ${symbol}`);
-
-  // 🔗 actually subscribe upstream now
-  try {
-    subscribeSymbols([symbol]);
-  } catch (e) {
-    console.warn(`[dataSocket] upstream subscribe failed for ${symbol}:`, e);
-  }
+/** Return latest known LTP for symbol, or null if none. */
+export function nowLtp(symbol: string): number | null {
+  const data = LAST_LTP.get(symbol);
+  if (!data) return null;
+  return data.ltp;
 }
-
-/** Optional helper if you want to force a subscription explicitly from other modules */
-export function subscribe(symbol: string) {
-  ensureSubscribed(symbol);
-}
-
-/** Testing/dev utility: inject a fake tick (e.g., from tests) */
-export function injectTick(symbol: string, ltp: number, ts?: number) {
-  LAST_LTP.set(symbol, { ltp, ts: ts ?? Date.now() });
-  console.log(`[dataSocket] (inject) ${symbol} -> ${ltp}`);
-  ingestSdkTick(symbol, ltp, { injected: true, ts: ts ?? Date.now() });
-}
-
-/** Expose last-tick map for diagnostics */
-export function __peekLastTicks() {
-  return new Map(LAST_LTP);
-}
-
-/** Simple heartbeat log */
-export function __logReconnectAttempt(n: number) {
-  console.log("trying to reconnect ", n);
-}
-
-/** Used by your SDK layer when it has actually subscribed upstream */
-export function __markSubscribed(symbols: string[]) {
-  for (const s of symbols) SUBSCRIBED.add(s);
-}
-
-/** Clear all runtime state */
-export function __resetAll() {
-  LAST_LTP.clear();
-  for (const s of LISTENERS.values()) s.clear();
-  LISTENERS.clear();
-  SUBSCRIBED.clear();
-  socketConnected = false;
-}
-
-// ---- Public facade object (legacy) -----------------------------------------
-
-export const dataSocket = {
-  connect,
-  setSocketConnected,
-  ingestSdkTick,
-  injectTick,
-  nowLtp,
-  onSymbolTick,
-  ensureSubscribed,
-  subscribe,
-  __peekLastTicks,
-  __logReconnectAttempt,
-  __markSubscribed,
-  __resetAll,
-};
