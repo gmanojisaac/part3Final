@@ -8,47 +8,86 @@ import { ensureSubscribed, onSymbolTick, nowLtp } from "./dataSocket";
 /**
  * Map TradingView-style symbol → Fyers symbol.
  *
- * Example:
- *   Input : NIFTY251118C25850
- *   Output: NSE:NIFTY25N1825850CE
+ * NIFTY is coded differently from BANKNIFTY / SENSEX.
+ *
+ * Examples (TV-style input):
+ *   NIFTY251125C25900       → NSE:NIFTY25NOV25900CE
+ *   BANKNIFTY251120P48000   → NSE:BANKNIFTY25N2048000PE
+ *   SENSEX251125C75000      → NSE:SENSEX25N2575000CE
  */
 function mapToFyersSymbol(human: string): string {
-  const m = /^NIFTY(\d{2})(\d{2})(\d{2})([CP])(\d+)$/.exec(human);
+  // Handle NIFTY / BANKNIFTY / SENSEX in TradingView-style:
+  // ROOT + YY + MM + DD + C/P + STRIKE
+  const m =
+    /^(NIFTY|BANKNIFTY|SENSEX)(\d{2})(\d{2})(\d{2})([CP])(\d+)$/.exec(human);
+
+  // Fallback: if it's not in that format, assume it's already a Fyers symbol
   if (!m) {
-    // Fallback: if it already looks like a Fyers symbol, just prefix NSE: if needed
     return human.startsWith("NSE:") ? human : `NSE:${human}`;
   }
 
-  const [, yy, mm, dd, cp, strike] = m;
-
-  const monthMap: Record<string, string> = {
-    "01": "J",
-    "02": "F",
-    "03": "M",
-    "04": "A",
-    "05": "M",
-    "06": "J",
-    "07": "J",
-    "08": "A",
-    "09": "S",
-    "10": "O",
-    "11": "N",
-    "12": "D",
-  };
-
-  const monCode = monthMap[mm] ?? "N"; // default N if unknown month
+  const [, root, yy, mm, dd, cp, strike] = m;
   const cepe = cp === "C" ? "CE" : "PE";
 
-  // ✅ Use full 2-digit year: "25" + "N" + "18" = "25N18"
-  const expiryCode = `${yy}${monCode}${dd}`;
+  // -----------------------
+  // NIFTY: 3-letter month, no day
+  // -----------------------
+  if (root === "NIFTY") {
+    const MONTH_3L: Record<string, string> = {
+      "01": "JAN",
+      "02": "FEB",
+      "03": "MAR",
+      "04": "APR",
+      "05": "MAY",
+      "06": "JUN",
+      "07": "JUL",
+      "08": "AUG",
+      "09": "SEP",
+      "10": "OCT",
+      "11": "NOV",
+      "12": "DEC",
+    };
 
-  // Final symbol: NSE:NIFTY25N1825950PE
-  return `NSE:NIFTY${expiryCode}${strike}${cepe}`;
+    const mon3 = MONTH_3L[mm];
+    if (!mon3) {
+      throw new Error(`mapToFyersSymbol: unknown month "${mm}" in "${human}"`);
+    }
+
+    // Example:
+    //   NIFTY251125C25900 → NSE:NIFTY25NOV25900CE
+    return `NSE:${root}${yy}${mon3}${strike}${cepe}`;
+  }
+
+  // -----------------------
+  // BANKNIFTY / SENSEX: letter + day (old coding)
+  // -----------------------
+  const MONTH_LETTER: Record<string, string> = {
+    "01": "A", // Jan
+    "02": "F", // Feb
+    "03": "M", // Mar
+    "04": "A", // Apr
+    "05": "M", // May
+    "06": "J", // Jun
+    "07": "J", // Jul
+    "08": "A", // Aug
+    "09": "S", // Sep
+    "10": "O", // Oct
+    "11": "N", // Nov
+    "12": "D", // Dec
+  };
+
+  const monLetter = MONTH_LETTER[mm];
+  if (!monLetter) {
+    throw new Error(`mapToFyersSymbol: unknown month "${mm}" in "${human}"`);
+  }
+
+  // Example:
+  //   BANKNIFTY251120P48000 → NSE:BANKNIFTY25N2048000PE
+  //   SENSEX251125C75000    → NSE:SENSEX25N2575000CE
+  const expiryCode = `${yy}${monLetter}${dd}`;
+  return `NSE:${root}${expiryCode}${strike}${cepe}`;
 }
 
-// Parse the webhook body text from TradingView / your alerts.
-// Example payload:
-//   "Accepted Entry + priorRisePct= 0.00 | stopPx=168.50 | sym=NIFTY251118P25950"
 function parseWebhook(text: string): {
   side: "BUY" | "SELL";
   stopPx?: number;
@@ -96,7 +135,8 @@ async function getLtpWithFallback(
   if (qSym && Number(qSym.ltp) > 0) return qSym.ltp;
 
   // 3) live subscribe + wait for first tick
-  ensureSubscribed(symbol);
+  await ensureSubscribed(symbol);
+
   const ltpFromTick = await new Promise<number | null>((resolve) => {
     let done = false;
 

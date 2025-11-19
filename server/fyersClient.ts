@@ -1,12 +1,23 @@
 /* eslint-disable no-console */
 
 //
-// Fyers client shims used by the state machine + P&L / Trades UI
-// - Paper engine book-keeping for positions
-// - getPnL() filtered to hide zero-only symbols
-// - getQuotesV3() compatibility for webhookHandler (accepts string or string[])
-// - Trade log via getTrades()
+// server/fyersClient.ts
+// -----------------------------------------------------------------------------
+// Fyers client shims used by the state machine + P&L / Trades UI.
+// This is a pure in-memory paper-trading engine. All real FYERS calls are
+// intentionally omitted; only the interfaces used by the rest of the server
+// are implemented.
 //
+// Exposed features:
+//   - isPaper(): read PAPERTRADE env
+//   - roundPrice(): 2-decimal rounding (no 0.5 snapping)
+//   - getQuotesV3(): FYERS v3-compatible quote shim for webhookHandler
+//   - placeLimitBuy / placeLimitSell(): paper orders with instant fill
+//   - getOpenQty(): current open quantity per symbol
+//   - computeQtyFromPnLContext(): capital-based sizing for NIFTY options
+//   - getPnL(): aggregated P&L + brokerage
+//   - getTrades(): trade log for UI
+// -----------------------------------------------------------------------------
 
 import { nowLtp } from "./dataSocket";
 
@@ -15,237 +26,395 @@ export function isPaper(): boolean {
   return v === "1" || v === "true" || v === "yes";
 }
 
-type OrderTag = { tag?: string };
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
 
-type Position = {
-  posQty: number;
-  avgPrice: number;
-  realized: number;
-};
+export type Side = "BUY" | "SELL";
 
-type TradeLogEntry = {
-  ts: number;
-  sym: string;
-  side: "BUY" | "SELL";
+interface Position {
+  posQty: number;    // +ve = long, -ve = short (we mostly use long only)
+  avgPrice: number;  // average entry price of the open position
+  realized: number;  // cumulative realized P&L for this symbol (gross, before brokerage)
+}
+
+export interface TradeLogEntry {
+  ts: number;           // epoch ms
+  symbol: string;
+  side: Side;
   qty: number;
   price: number;
-  realized: number; // realized P&L contributed by this trade
-};
+  realized: number;     // P&L for this trade (0 for BUY, +/- for SELL)
+  tag?: string;
+}
 
-// ---- In-memory stores (paper) ----------------------------------------------
+// -----------------------------------------------------------------------------
+// In-memory state
+// -----------------------------------------------------------------------------
 
-const POS = new Map<string, Position>();
-
-// Executed trades log (for /trades and /trades-ui)
+const POSITIONS = new Map<string, Position>();
 const TRADES: TradeLogEntry[] = [];
 
-// ---- Helpers ----------------------------------------------------------------
+let paperOrderCounter = 1;
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
 
 function ensurePos(sym: string): Position {
-  let p = POS.get(sym);
+  let p = POSITIONS.get(sym);
   if (!p) {
     p = { posQty: 0, avgPrice: 0, realized: 0 };
-    POS.set(sym, p);
+    POSITIONS.set(sym, p);
   }
   return p;
 }
 
-// Record a trade into in-memory log
-function recordTrade(
-  sym: string,
-  side: "BUY" | "SELL",
-  qty: number,
-  price: number,
-  realizedPnL: number
-) {
-  if (qty <= 0) return;
-  TRADES.push({
-    ts: Date.now(),
-    sym,
-    side,
-    qty,
-    price,
-    realized: realizedPnL,
-  });
+function nextPaperOrderId(): string {
+  const id = paperOrderCounter++;
+  return `PPR-${id.toString().padStart(5, "0")}`;
 }
 
-// ---- Public helpers used by the state machine -------------------------------
+function formatTime(d: Date): string {
+  // Matches logs like "11:00:07"
+  const hh = d.getHours().toString().padStart(2, "0");
+  const mm = d.getMinutes().toString().padStart(2, "0");
+  const ss = d.getSeconds().toString().padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+// -----------------------------------------------------------------------------
+// Public helpers used by the state machine & webhook handler
+// -----------------------------------------------------------------------------
 
 export function roundPrice(px: number): number {
-  // Round to nearest 0.5 (common for options in your logic)
-  return Math.round(px * 2) / 2;
+  // 👉 2 decimals, no snapping to 0.5
+  return Math.round(px * 100) / 100;
 }
 
 export function getOpenQty(sym: string): number {
   return ensurePos(sym).posQty;
 }
 
-// Very simple qty logic:
-// - If there is an open position, reuse its absolute size for exits (no-flip).
-// - If flat, use a default lot size from env or fallback.
-const DEFAULT_QTY = Number(process.env.DEFAULT_TRADE_QTY ?? process.env.QTY ?? 50);
+// Qty logic:
+// -----------------------------------------------------------------------------
+// - If there is an open position, reuse its absolute size for exits (no flip).
+// - If flat, size based on CAPITAL, symbol lot size and current LTP.
+//   CAPITAL is read from env: CAPITAL or TRADING_CAPITAL (fallback 20000).
+//   NIFTY index options (not BANKNIFTY/FINNIFTY) are assumed to have lot size 75.
+// -----------------------------------------------------------------------------
 
-export function computeQtyFromPnLContext(sym: string): number {
-  const open = Math.abs(getOpenQty(sym));
-  if (open > 0) return open;
+const DEFAULT_QTY =
+  Number(process.env.DEFAULT_TRADE_QTY ?? process.env.QTY ?? "50") || 50;
+
+const CAPITAL =
+  Number(process.env.CAPITAL ?? process.env.TRADING_CAPITAL ?? "20000") || 20000;
+
+function getLotSize(sym: string): number {
+  const upper = sym.toUpperCase();
+
+  // NIFTY index options (CE/PE) – treat as lot size 75,
+  // but exclude BANKNIFTY / FINNIFTY etc.
+  if (upper.includes("NIFTY") && !upper.includes("BANKNIFTY") && !upper.includes("FINNIFTY")) {
+    return 75;
+  }
+
+  // Fallback: treat DEFAULT_QTY as an effective lot for everything else.
   return DEFAULT_QTY;
 }
 
-// ---- Paper engine: placeLimitBuy / placeLimitSell ---------------------------
+export function computeQtyFromPnLContext(sym: string, ltpOverride?: number): number {
+  // If we already have an open position, keep that size (for exits).
+  const open = Math.abs(getOpenQty(sym));
+  if (open > 0) return open;
 
-export function placeLimitBuy(
-  sym: string,
-  qty: number,
-  limitPx: number,
-  info?: OrderTag
-): void {
-  if (qty <= 0) return;
+  // Flat: compute fresh qty from capital and current price.
+  const lotSize = getLotSize(sym);
 
-  const p = ensurePos(sym);
-  const totalCost = p.avgPrice * p.posQty + limitPx * qty;
-  const newQty = p.posQty + qty;
-  p.posQty = newQty;
-  p.avgPrice = newQty !== 0 ? totalCost / newQty : 0;
+  const px =
+    typeof ltpOverride === "number" && ltpOverride > 0
+      ? ltpOverride
+      : nowLtp(sym);
 
-  // BUY doesn't realize P&L by itself (opening / adding)
-  recordTrade(sym, "BUY", qty, limitPx, 0);
-
-  const t = new Date().toTimeString().slice(0, 8);
-  console.log(
-    `[PAPER] ${t} Placed BUY LIMIT ${qty} ${sym} @ ${limitPx} ${
-      info?.tag ? `(tag=${info.tag})` : ""
-    } (orderId=PPR-${Math.floor(Math.random() * 100000)})`
-  );
-  console.log(`[PAPER] ${t} FILLED BUY ${qty} ${sym} @ ${limitPx}`);
-}
-
-export function placeLimitSell(
-  sym: string,
-  qty: number,
-  limitPx: number,
-  info?: OrderTag
-): void {
-  if (qty <= 0) return;
-
-  const p = ensurePos(sym);
-  let realizedOnThisTrade = 0;
-
-  // Close existing long first (if any)
-  const closeQty = Math.min(qty, Math.max(0, p.posQty));
-  if (closeQty > 0) {
-    const pnl = (limitPx - p.avgPrice) * closeQty;
-    p.realized += pnl;
-    realizedOnThisTrade += pnl;
-    p.posQty -= closeQty;
-    if (p.posQty === 0) p.avgPrice = 0;
+  if (typeof px !== "number" || !isFinite(px) || px <= 0) {
+    // If we can't get a sensible price, fall back to default fixed quantity.
+    return DEFAULT_QTY;
   }
 
-  // Remaining quantity becomes new short (if any)
-  const remaining = qty - closeQty;
-  if (remaining > 0) {
-    const totalCost = p.avgPrice * p.posQty - limitPx * remaining;
-    const newQty = p.posQty - remaining;
-    p.posQty = newQty;
-    p.avgPrice = newQty !== 0 ? totalCost / newQty : 0;
-  }
+  const costPerLot = px * lotSize;
+  if (costPerLot <= 0) return DEFAULT_QTY;
 
-  // Log SELL trade with realized P&L from the closed portion
-  recordTrade(sym, "SELL", qty, limitPx, realizedOnThisTrade);
+  const lotsFloat = CAPITAL / costPerLot;
+  let lots = Math.floor(lotsFloat);
+  if (lots < 1) lots = 1; // at least 1 lot
 
-  const t = new Date().toTimeString().slice(0, 8);
-  console.log(
-    `[PAPER] ${t} Placed SELL LIMIT ${qty} ${sym} @ ${limitPx} ${
-      info?.tag ? `(tag=${info.tag})` : ""
-    } (orderId=PPR-${Math.floor(Math.random() * 100000)})`
-  );
-  console.log(`[PAPER] ${t} FILLED SELL ${qty} ${sym} @ ${limitPx}`);
+  const qty = lots * lotSize;
+  return qty;
 }
 
-// ---- Quotes shim for webhookHandler ----------------------------------------
-//
-// webhookHandler calls:
-//   const q = await getQuotesV3(symbol);
-//   const qSym = q[symbol];
-//   if (qSym && Number(qSym.ltp) > 0) return qSym.ltp;
-//
+// -----------------------------------------------------------------------------
+// getQuotesV3 shim – minimal FYERS v3-like quote API
+// -----------------------------------------------------------------------------
 
 export async function getQuotesV3(
-  symbolOrSymbols: string | string[]
-): Promise<Record<string, { ltp: number }>> {
-  const symbols = Array.isArray(symbolOrSymbols)
-    ? symbolOrSymbols
-    : [symbolOrSymbols];
+  symbols: string | string[]
+): Promise<{ s: string; d: { symbol: string; ltp: number }[] }> {
+  const arr = Array.isArray(symbols) ? symbols : [symbols];
+  const d = arr.map((sym) => ({
+    symbol: sym,
+    ltp: nowLtp(sym) ?? NaN,
+  }));
 
-  const out: Record<string, { ltp: number }> = {};
-
-  for (const sym of symbols) {
-    const fromTick = nowLtp(sym);
-    const p = POS.get(sym);
-
-    // Prefer real-time tick if present, else use avgPrice as a rough proxy
-    const ltp =
-      fromTick != null
-        ? fromTick
-        : p && p.posQty !== 0
-        ? p.avgPrice
-        : 0;
-
-    out[sym] = { ltp };
-  }
-
-  return out;
+  return { s: "ok", d };
 }
 
-// ---- P&L for UI -------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Paper order placement
+// -----------------------------------------------------------------------------
 
-export function getPnL() {
-  let realized = 0;
+function applyBuyToPosition(sym: string, qty: number, price: number): void {
+  const p = ensurePos(sym);
+
+  if (p.posQty >= 0) {
+    // Add to existing long (or open new long)
+    const newQty = p.posQty + qty;
+    const totalCost = p.avgPrice * p.posQty + price * qty;
+    p.avgPrice = newQty > 0 ? totalCost / newQty : 0;
+    p.posQty = newQty;
+  } else {
+    // Long buy against an existing short. For simplicity, treat as closing short,
+    // but this scenario should normally not happen in your strategy.
+    const closing = Math.min(qty, -p.posQty);
+    const remaining = qty - closing;
+    // Realized for closing part: entry (short) at avgPrice, exit (buy) at price.
+    p.realized += (p.avgPrice - price) * closing;
+    p.posQty += closing; // remember posQty is negative here
+
+    if (remaining > 0) {
+      // Open new long with the leftover
+      const newQty = remaining;
+      p.avgPrice = price;
+      p.posQty = newQty;
+    } else if (p.posQty === 0) {
+      p.avgPrice = 0;
+    }
+  }
+}
+
+function applySellToPosition(sym: string, qty: number, price: number): number {
+  const p = ensurePos(sym);
+  let realizedForTrade = 0;
+
+  if (p.posQty > 0) {
+    // Closing or reducing a long
+    const closing = Math.min(qty, p.posQty);
+    realizedForTrade = (price - p.avgPrice) * closing;
+    p.realized += realizedForTrade;
+    p.posQty -= closing;
+
+    if (p.posQty === 0) {
+      p.avgPrice = 0;
+    }
+  } else if (p.posQty === 0) {
+    // Opening a short – not expected in your strategy, but we support it.
+    p.posQty = -qty;
+    p.avgPrice = price;
+  } else {
+    // Increasing an existing short
+    const newQty = p.posQty - qty; // more negative
+    const totalProceeds = p.avgPrice * -p.posQty + price * qty;
+    p.avgPrice = newQty !== 0 ? totalProceeds / -newQty : 0;
+    p.posQty = newQty;
+  }
+
+  return realizedForTrade;
+}
+
+export async function placeLimitBuy(
+  sym: string,
+  qty: number,
+  limitPrice: number,
+  meta?: { tag?: string }
+): Promise<void> {
+  const tag = meta?.tag;
+  const orderId = nextPaperOrderId();
+  const d = new Date();
+  const t = formatTime(d);
+
+  if (!isPaper()) {
+    console.warn("[LIVE] placeLimitBuy called but live trading is not implemented in fyersClient.ts");
+  }
+
+  console.log(
+    `[PAPER] ${t} Placed BUY LIMIT ${qty} ${sym} @ ${limitPrice} ${
+      tag ? `(tag=${tag}) ` : ""
+    }(orderId=${orderId})`
+  );
+
+  // Instant full fill at the limit price
+  console.log(
+    `[PAPER] ${t} FILLED BUY ${qty} ${sym} @ ${limitPrice}`
+  );
+
+  applyBuyToPosition(sym, qty, limitPrice);
+
+  // Log trade (BUY has 0 realized P&L)
+  TRADES.push({
+    ts: d.getTime(),
+    symbol: sym,
+    side: "BUY",
+    qty,
+    price: limitPrice,
+    realized: 0,
+    tag,
+  });
+}
+
+export async function placeLimitSell(
+  sym: string,
+  qty: number,
+  limitPrice: number,
+  meta?: { tag?: string }
+): Promise<void> {
+  const tag = meta?.tag;
+  const orderId = nextPaperOrderId();
+  const d = new Date();
+  const t = formatTime(d);
+
+  if (!isPaper()) {
+    console.warn("[LIVE] placeLimitSell called but live trading is not implemented in fyersClient.ts");
+  }
+
+  console.log(
+    `[PAPER] ${t} Placed SELL LIMIT ${qty} ${sym} @ ${limitPrice} ${
+      tag ? `(tag=${tag}) ` : ""
+    }(orderId=${orderId})`
+  );
+
+  // Instant full fill at the limit price
+  console.log(
+    `[PAPER] ${t} FILLED SELL ${qty} ${sym} @ ${limitPrice}`
+  );
+
+  const realizedForTrade = applySellToPosition(sym, qty, limitPrice);
+
+  TRADES.push({
+    ts: d.getTime(),
+    symbol: sym,
+    side: "SELL",
+    qty,
+    price: limitPrice,
+    realized: realizedForTrade,
+    tag,
+  });
+}
+
+// -----------------------------------------------------------------------------
+// P&L computation (with brokerage)
+// -----------------------------------------------------------------------------
+//
+// Assumptions:
+//   - Position.realized is "gross realized" P&L (before brokerage).
+//   - Brokerage is 10% of gross *positive* realized P&L (global).
+//   - Brokerage is returned as a negative number and reduces final P&L.
+// -----------------------------------------------------------------------------
+
+export function getPnL(): {
+  realized: number;      // net realized AFTER brokerage
+  unrealized: number;
+  total: number;         // net total = realized + unrealized
+  brokerage: number;     // negative number (cost)
+  grossRealized: number; // BEFORE brokerage
+  bySymbol: Record<
+    string,
+    {
+      realized: number;      // net realized after brokerage
+      grossRealized: number; // before brokerage
+      unrealized: number;
+      brokerage: number;     // negative cost for this symbol
+      posQty: number;
+      avgPrice: number;
+      ltp: number | null;
+    }
+  >;
+} {
+  let grossRealized = 0;
   let unrealized = 0;
+
+  // First pass: aggregate grossRealized and unrealized
+  for (const [sym, p] of POSITIONS.entries()) {
+    const ltp = nowLtp(sym);
+    const u =
+      p.posQty !== 0 && typeof ltp === "number"
+        ? (ltp - p.avgPrice) * p.posQty
+        : 0;
+
+    grossRealized += p.realized;
+    unrealized += u;
+  }
+
+  // Brokerage: 10% of gross positive realized
+  const brokerage =
+    grossRealized > 0 ? -0.1 * grossRealized : 0;
+
+  const netRealized = grossRealized + brokerage;
+  const total = netRealized + unrealized;
 
   const bySymbol: Record<
     string,
     {
+      realized: number;
+      grossRealized: number;
+      unrealized: number;
+      brokerage: number;
       posQty: number;
       avgPrice: number;
-      last: number;
-      realized: number;
-      unrealized: number;
+      ltp: number | null;
     }
   > = {};
 
-  for (const [sym, p] of POS.entries()) {
-    if (!p) continue;
+  // Second pass: symbol-level breakdown (including brokerage share)
+  for (const [sym, p] of POSITIONS.entries()) {
+    const ltp = nowLtp(sym);
+    const u =
+      p.posQty !== 0 && typeof ltp === "number"
+        ? (ltp - p.avgPrice) * p.posQty
+        : 0;
 
-    const last =
-      nowLtp(sym) ??
-      (p.posQty !== 0 ? p.avgPrice : 0); // fallback if no tick and flat
-
-    const u = p.posQty !== 0 ? (last - p.avgPrice) * p.posQty : 0;
-
-    realized += p.realized;
-    unrealized += u;
-
-    // Only show symbols that have something non-trivial
+    // Skip fully-zero symbols to keep the UI tidy
     if (p.posQty === 0 && p.realized === 0 && u === 0) continue;
 
+    const grossSym = p.realized;
+    const symBrokerage =
+      grossRealized > 0 && grossSym > 0
+        ? (grossSym / grossRealized) * brokerage
+        : 0;
+    const netSym = grossSym + symBrokerage;
+
     bySymbol[sym] = {
-      posQty: p.posQty,
-      avgPrice: p.avgPrice || 0,
-      last,
-      realized: p.realized,
+      realized: netSym,
+      grossRealized: grossSym,
       unrealized: u,
+      brokerage: symBrokerage,
+      posQty: p.posQty,
+      avgPrice: p.avgPrice,
+      ltp: typeof ltp === "number" ? ltp : null,
     };
   }
 
   return {
-    realized,
+    realized: netRealized,
     unrealized,
-    total: realized + unrealized,
+    total,
+    brokerage,
+    grossRealized,
     bySymbol,
   };
 }
 
-// ---- Trades for UI ----------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Trades for UI
+// -----------------------------------------------------------------------------
 
 export function getTrades(): TradeLogEntry[] {
   // Return a shallow copy so callers can't mutate internal state

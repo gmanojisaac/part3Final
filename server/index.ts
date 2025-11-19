@@ -7,42 +7,62 @@ import "dotenv/config";
 // ---------------------------------------------------------------------------
 // Imports
 // ---------------------------------------------------------------------------
-import express from "express";
+import express, { type Request, type Response } from "express";
 import bodyParser from "body-parser";
 
 import { handleWebhookText, webhookStatus } from "./webhookHandler";
-import { dataSocket } from "./dataSocket"; // ensures sockets get initialized
-import { getPnL, isPaper } from "./fyersClient";
+import { connect as connectDataSocket } from "./dataSocket"; // ensures sockets get initialized
+import { getPnL, getTrades, isPaper } from "./fyersClient";
 import { marketClock } from "./marketHours";
 import { getRelays, relayToAll } from "./relayStore";
 
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
-const PORT = Number(process.env.PORT ?? 3000);
 const app = express();
+const PORT = Number(process.env.PORT ?? 2000);
 
-// For webhook: use raw text
-app.use("/webhook", bodyParser.text({ type: "*/*" }));
+// We want to be able to accept plain-text webhooks easily.
+app.use(bodyParser.text({ type: "*/*" }));
 
-// For all other routes: JSON
-app.use(bodyParser.json());
+// ---------------------------------------------------------------------------
+// Root
+// ---------------------------------------------------------------------------
+app.get("/", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html>
+  <head>
+    <title>Engine</title>
+    <style>
+      body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; }
+      a { color: #0b7285; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      ul { line-height: 1.6; }
+    </style>
+  </head>
+  <body>
+    <h1>Automated BOT – Server</h1>
+    <ul>
+      <li><a href="/status-ui">Status UI</a></li>
+      <li><a href="/pnl-ui">PnL UI</a></li>
+      <li><a href="/relays-ui">Relays UI</a></li>
+    </ul>
+  </body>
+</html>`);
+});
 
 // ---------------------------------------------------------------------------
 // Webhook endpoint
 // ---------------------------------------------------------------------------
-app.post("/webhook", async (req, res) => {
-  const raw =
-    typeof req.body === "string" ? req.body : JSON.stringify(req.body);
-
+app.post("/webhook", async (req: Request, res: Response) => {
+  const raw = typeof req.body === "string" ? req.body : "";
   try {
     const result = await handleWebhookText(raw);
     res.json({ ok: true, result });
   } catch (err: any) {
     console.error("[/webhook] ERROR:", err);
-    res
-      .status(500)
-      .json({ ok: false, error: err?.message ?? String(err) });
+    res.status(500).json({ ok: false, error: err?.message ?? String(err) });
   }
 });
 
@@ -50,296 +70,239 @@ app.post("/webhook", async (req, res) => {
 // JSON APIs
 // ---------------------------------------------------------------------------
 
-// Engine / webhook status
-app.get("/status", (_req, res) => {
+// Engine / market status
+app.get("/status", (_req: Request, res: Response) => {
   res.json(webhookStatus());
 });
 
-// PnL JSON
-app.get("/pnl", (_req, res) => {
-  res.json(getPnL());
+// PnL snapshot (used by /pnl-ui)
+app.get("/pnl", (_req: Request, res: Response) => {
+  const pnl = getPnL();
+  const trades = getTrades();
+
+  // Flatten bySymbol into an array of "positions" for UI convenience
+  const positions = Object.entries(pnl.bySymbol).map(([symbol, row]) => ({
+    symbol,
+    qty: row.posQty,
+    avgPrice: row.avgPrice,
+    ltp: row.ltp,
+    unrealized: row.unrealized,
+    realized: row.realized,
+    brokerage: row.brokerage,
+    grossRealized: row.grossRealized,
+  }));
+
+  res.json({
+    realized: pnl.realized,
+    unrealized: pnl.unrealized,
+    total: pnl.total,
+    brokerage: pnl.brokerage,
+    grossRealized: pnl.grossRealized,
+    positions,
+    trades,
+  });
 });
 
-// Relays JSON
-app.get("/relays", (_req, res) => {
+// Relay list
+app.get("/relays", (_req: Request, res: Response) => {
   res.json({ relays: getRelays() });
 });
 
-// Optional: relay test broadcast
-app.post("/relay-test", async (req, res) => {
-  const payload =
-    typeof req.body === "string" ? req.body : JSON.stringify(req.body);
+// Relay-test helper: broadcast given body to all relays
+app.post("/relay-test", async (req: Request, res: Response) => {
+  const payload = typeof req.body === "string" ? req.body : String(req.body ?? "");
   try {
     const result = await relayToAll(payload);
     res.json({ ok: true, result });
   } catch (err: any) {
-    res
-      .status(500)
-      .json({ ok: false, error: err?.message ?? String(err) });
+    console.error("[/relay-test] ERROR:", err);
+    res.status(500).json({ ok: false, error: err?.message ?? String(err) });
   }
 });
 
-// Market clock JSON
-app.get("/market-clock", (_req, res) => {
-  res.json(marketClock());
-});
-
 // ---------------------------------------------------------------------------
-// Simple HTML UIs
+// HTML UIs
 // ---------------------------------------------------------------------------
 
 // Status UI
-app.get("/status-ui", (_req, res) => {
-  res.type("html").send(`<!doctype html>
+app.get("/status-ui", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
 <html>
-<head>
-  <meta charset="utf-8" />
-  <title>Webhook / Engine Status</title>
-  <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; }
-    pre { background:#111; color:#0f0; padding:12px; border-radius:6px; }
-    .ok { color: #0a0; }
-    .bad { color: #c00; }
-  </style>
-</head>
-<body>
-  <h1>Webhook / Engine Status</h1>
-  <div id="status"></div>
-  <pre id="raw"></pre>
+  <head>
+    <title>Status</title>
+    <style>
+      body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; }
+      table { border-collapse: collapse; margin-top: 12px; }
+      th, td { padding: 4px 8px; border: 1px solid #ccc; font-size: 13px; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+      .ok { background: #d3f9d8; color: #2b8a3e; }
+      .bad { background: #ffe3e3; color: #c92a2a; }
+      .muted { color: #555; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>Webhook / Engine Status</h1>
+    <div id="status"></div>
+    <div class="muted">Auto-refreshes every 5 seconds.</div>
 
-  <script>
-    async function refresh() {
-      try {
-        const res = await fetch('/status');
-        const data = await res.json();
-        const el = document.getElementById('status');
+    <script>
+      async function refresh() {
+        try {
+          const res = await fetch('/status');
+          const data = await res.json();
 
-        const parts = [];
-        if (typeof data.paper !== 'undefined') {
-          parts.push('Mode: ' + (data.paper ? 'PAPER' : 'LIVE'));
+          const rows = [];
+          rows.push('<tr><th>Paper</th><td>' + (data.paper ? 'YES' : 'NO') + '</td></tr>');
+          rows.push('<tr><th>Market Open (clock)</th><td>' + (data.nowOpen ? 'YES' : 'NO') + '</td></tr>');
+          rows.push('<tr><th>Market Open (rule)</th><td>' + (data.marketOpen ? 'YES' : 'NO') + '</td></tr>');
+
+          const html = '<table>' + rows.join('') + '</table>';
+          document.getElementById('status').innerHTML = html;
+        } catch (e) {
+          document.getElementById('status').textContent = 'Error loading /status: ' + e;
         }
-        if (typeof data.nowOpen !== 'undefined') {
-          parts.push('Market now: ' + (data.nowOpen ? 'OPEN' : 'CLOSED'));
+      }
+
+      refresh();
+      setInterval(refresh, 5000);
+    </script>
+  </body>
+</html>`);
+});
+
+// PnL UI – no raw JSON, only tables with 2-decimal fields
+app.get("/pnl-ui", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html>
+  <head>
+    <title>PnL</title>
+    <style>
+      body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; }
+      h1 { margin-bottom: 8px; }
+      h2 { margin-top: 24px; margin-bottom: 8px; font-size: 16px; }
+      table { border-collapse: collapse; margin-top: 8px; width: 100%; max-width: 900px; }
+      th, td { padding: 4px 8px; border: 1px solid #ccc; font-size: 12px; text-align: right; }
+      th:first-child, td:first-child { text-align: left; }
+      .pos { color: #2b8a3e; }
+      .neg { color: #c92a2a; }
+      .muted { color: #555; font-size: 12px; margin-top: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>PnL Snapshot</h1>
+    <div id="summary"></div>
+    <h2>Trades</h2>
+    <div id="trades"></div>
+    <div class="muted">Auto-refreshes every 3 seconds.</div>
+
+    <script>
+      function fmt2(x) {
+        if (x == null || isNaN(x)) return '-';
+        return Number(x).toFixed(2);
+      }
+
+      function cls(x) {
+        if (x > 0) return 'pos';
+        if (x < 0) return 'neg';
+        return '';
+      }
+
+      function fmtTime(ts) {
+        const d = new Date(ts);
+        const time = d.toLocaleTimeString('en-GB', { hour12: false });
+        const date = d.toLocaleDateString('en-GB'); // dd/mm/yyyy
+        return time + ' ' + date.replace(/\\//g, '/');
+      }
+
+      async function refresh() {
+        try {
+          const res = await fetch('/pnl');
+          const data = await res.json();
+
+          // --- Summary table ---
+          const total = data.total || 0;
+          const realized = data.realized || 0;
+          const unrealized = data.unrealized || 0;
+          const brokerage = data.brokerage || 0;
+
+          let summaryHtml = '<table>';
+          summaryHtml += '<thead><tr><th>Metric</th><th>Value</th></tr></thead>';
+          summaryHtml += '<tbody>';
+          summaryHtml += '<tr><td>Total P&L</td><td class="' + cls(total) + '">' + fmt2(total) + '</td></tr>';
+          summaryHtml += '<tr><td>Realized P&L</td><td class="' + cls(realized) + '">' + fmt2(realized) + '</td></tr>';
+          summaryHtml += '<tr><td>Unrealized P&L</td><td class="' + cls(unrealized) + '">' + fmt2(unrealized) + '</td></tr>';
+          summaryHtml += '<tr><td>Brokerage (10% of profit)</td><td class="' + cls(brokerage) + '">' + fmt2(brokerage) + '</td></tr>';
+          summaryHtml += '</tbody></table>';
+          document.getElementById('summary').innerHTML = summaryHtml;
+
+          // --- Trades table ---
+          const trades = Array.isArray(data.trades) ? data.trades.slice().sort((a, b) => b.ts - a.ts) : [];
+          const rows = [];
+          for (const t of trades) {
+            const pnl = t.realized || 0;
+            rows.push(
+              '<tr>' +
+                '<td>' + fmtTime(t.ts) + '</td>' +
+                '<td>' + (t.symbol || '') + '</td>' +
+                '<td>' + (t.side || '') + '</td>' +
+                '<td>' + (t.qty || 0) + '</td>' +
+                '<td>' + fmt2(t.price) + '</td>' +
+                '<td class="' + cls(pnl) + '">' + fmt2(pnl) + '</td>' +
+              '</tr>'
+            );
+          }
+
+          let tradesHtml = '<table>';
+          tradesHtml += '<thead><tr>' +
+            '<th>Time</th>' +
+            '<th>Symbol</th>' +
+            '<th>Side</th>' +
+            '<th>Qty</th>' +
+            '<th>Price</th>' +
+            '<th>P&L</th>' +
+          '</tr></thead>';
+          tradesHtml += '<tbody>' + (rows.join('') || '<tr><td colspan="6" style="text-align:center;">No trades yet.</td></tr>') + '</tbody>';
+          tradesHtml += '</table>';
+
+          document.getElementById('trades').innerHTML = tradesHtml;
+        } catch (e) {
+          document.getElementById('summary').textContent = 'Error loading /pnl: ' + e;
+          document.getElementById('trades').textContent = '';
         }
-
-        el.innerHTML = '<p>' + parts.join('<br>') + '</p>';
-
-        document.getElementById('raw').textContent = JSON.stringify(data, null, 2);
-      } catch (e) {
-        document.getElementById('status').innerHTML =
-          '<p class="bad">Error loading status: ' + e + '</p>';
       }
-    }
-    refresh();
-    setInterval(refresh, 5000);
-  </script>
-</body>
+
+      refresh();
+      setInterval(refresh, 3000);
+    </script>
+  </body>
 </html>`);
 });
 
-// PnL UI
-app.get("/pnl-ui", (_req, res) => {
-  res.type("html").send(`<!doctype html>
+// Simple relays UI
+app.get("/relays-ui", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  const relays = getRelays();
+  res.send(`<!DOCTYPE html>
 <html>
-<head>
-  <meta charset="utf-8" />
-  <title>P&amp;L</title>
-  <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; }
-    h1 { margin-bottom: 0.5rem; }
-    .summary { margin-bottom: 1rem; }
-    .summary span { display:inline-block; min-width: 160px; }
-    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
-    th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: right; }
-    th { background: #f0f0f0; }
-    td.sym, th.sym { text-align: left; }
-    .pos-pos { color: #0a0; }
-    .pos-neg { color: #c00; }
-    pre { background:#111; color:#0f0; padding:12px; border-radius:6px; margin-top:16px; }
-  </style>
-</head>
-<body>
-  <h1>P&amp;L</h1>
-  <div class="summary" id="summary"></div>
-  <table id="pnl-table">
-    <thead>
-      <tr>
-        <th class="sym">Symbol</th>
-        <th>Pos Qty</th>
-        <th>Avg Price</th>
-        <th>Last</th>
-        <th>Realized</th>
-        <th>Unrealized</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  </table>
-
-  <pre id="raw"></pre>
-
-  <script>
-    function fmt(x) {
-      if (typeof x !== 'number') return x;
-      return x.toFixed(2);
-    }
-
-    function clsPnL(v) {
-      if (v > 0) return 'pos-pos';
-      if (v < 0) return 'pos-neg';
-      return '';
-    }
-
-    async function refresh() {
-      try {
-        const res = await fetch('/pnl');
-        const data = await res.json();
-
-        const sum = document.getElementById('summary');
-        sum.innerHTML =
-          '<span>Total: ' + fmt(data.total) + '</span>' +
-          '<span>Realized: ' + fmt(data.realized) + '</span>' +
-          '<span>Unrealized: ' + fmt(data.unrealized) + '</span>';
-
-        const tbody = document.querySelector('#pnl-table tbody');
-        tbody.innerHTML = '';
-
-        const bySymbol = data.bySymbol || {};
-        Object.keys(bySymbol).sort().forEach(sym => {
-          const row = bySymbol[sym];
-          const tr = document.createElement('tr');
-
-          tr.innerHTML =
-            '<td class="sym">' + sym + '</td>' +
-            '<td>' + row.posQty + '</td>' +
-            '<td>' + fmt(row.avgPrice) + '</td>' +
-            '<td>' + fmt(row.last) + '</td>' +
-            '<td class="' + clsPnL(row.realized) + '">' + fmt(row.realized) + '</td>' +
-            '<td class="' + clsPnL(row.unrealized) + '">' + fmt(row.unrealized) + '</td>';
-
-          tbody.appendChild(tr);
-        });
-
-        document.getElementById('raw').textContent = JSON.stringify(data, null, 2);
-      } catch (e) {
-        document.getElementById('summary').innerHTML =
-          '<span style="color:#c00">Error loading P&amp;L: ' + e + '</span>';
+  <head>
+    <title>Relays</title>
+    <style>
+      body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; }
+      ul { line-height: 1.6; }
+    </style>
+  </head>
+  <body>
+    <h1>Relay URLs</h1>
+    <ul>
+      ${
+        relays.length
+          ? relays.map((r) => `<li>${r}</li>`).join("")
+          : "<li><em>No relays configured (set RELAY_URLS env)</em></li>"
       }
-    }
-
-    refresh();
-    setInterval(refresh, 3000);
-  </script>
-</body>
-</html>`);
-});
-
-// Relays UI
-app.get("/relays-ui", (_req, res) => {
-  res.type("html").send(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Relays</title>
-  <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; }
-    li { margin: 4px 0; }
-    code { background:#f4f4f4; padding:2px 4px; border-radius:3px; }
-    pre { background:#111; color:#0f0; padding:12px; border-radius:6px; margin-top:16px; }
-  </style>
-</head>
-<body>
-  <h1>Configured Relays</h1>
-  <p>These come from <code>RELAY_URLS</code> env (and any additions at runtime).</p>
-  <ul id="relay-list"></ul>
-  <pre id="raw"></pre>
-
-  <script>
-    async function refresh() {
-      try {
-        const res = await fetch('/relays');
-        const data = await res.json();
-        const list = document.getElementById('relay-list');
-        list.innerHTML = '';
-        (data.relays || []).forEach(url => {
-          const li = document.createElement('li');
-          li.textContent = url;
-          list.appendChild(li);
-        });
-        document.getElementById('raw').textContent = JSON.stringify(data, null, 2);
-      } catch (e) {
-        document.getElementById('relay-list').innerHTML =
-          '<li style="color:#c00">Error loading relays: ' + e + '</li>';
-      }
-    }
-    refresh();
-    setInterval(refresh, 10000);
-  </script>
-</body>
-</html>`);
-});
-
-// Market clock UI
-app.get("/market-ui", (_req, res) => {
-  res.type("html").send(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Market Clock</title>
-  <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; }
-    pre { background:#111; color:#0f0; padding:12px; border-radius:6px; }
-  </style>
-</head>
-<body>
-  <h1>Market Clock</h1>
-  <div id="info"></div>
-  <pre id="raw"></pre>
-
-  <script>
-    async function refresh() {
-      try {
-        const res = await fetch('/market-clock');
-        const data = await res.json();
-        const info = document.getElementById('info');
-        info.innerHTML =
-          '<p>Now: ' + (data.nowLocal || '') + '</p>' +
-          '<p>Is Market Open Now: ' + (data.isMarketOpenNow ? 'YES' : 'NO') + '</p>' +
-          '<p>Session: ' + (data.sessionLabel || '') + '</p>';
-        document.getElementById('raw').textContent = JSON.stringify(data, null, 2);
-      } catch (e) {
-        document.getElementById('info').innerHTML =
-          '<p style="color:#c00">Error loading market clock: ' + e + '</p>';
-      }
-    }
-    refresh();
-    setInterval(refresh, 5000);
-  </script>
-</body>
-</html>`);
-});
-
-// Root index page
-app.get("/", (_req, res) => {
-  res.type("html").send(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Relay / Engine Control</title>
-  <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; }
-    ul { line-height: 1.8; }
-  </style>
-</head>
-<body>
-  <h1>Relay / Engine Control</h1>
-  <p>Mode: <strong>${isPaper() ? "PAPER" : "LIVE"}</strong></p>
-  <ul>
-    <li><a href="/status-ui">Status UI</a></li>
-    <li><a href="/pnl-ui">PnL UI</a></li>
-    <li><a href="/relays-ui">Relays UI</a></li>
-    <li><a href="/market-ui">Market Clock</a></li>
-  </ul>
-</body>
+    </ul>
+  </body>
 </html>`);
 });
 
@@ -348,11 +311,25 @@ app.get("/", (_req, res) => {
 // ---------------------------------------------------------------------------
 app.listen(PORT, () => {
   console.log(
-    `[server] Listening on ${PORT} (papertrade=${isPaper()}) — relay UI at http://localhost:${PORT}/relays-ui  |  status UI at /status-ui  |  pnl UI at /pnl-ui`
+    `[server] Listening on ${PORT} (papertrade=${isPaper()}) — relays UI at http://localhost:${PORT}/relays-ui | status UI at /status-ui | pnl UI at /pnl-ui`
   );
 
-  // Touch dataSocket so it initializes (if it has side-effects on import)
-  if (dataSocket) {
-    console.log("[server] dataSocket imported, sockets should be connecting…");
+  // Kick off FYERS data socket connection on startup
+  connectDataSocket()
+    .then(() => {
+      console.log("[server] dataSocket connected (FYERS WS initialized)");
+    })
+    .catch((err) => {
+      console.error("[server] Failed to connect FYERS data socket:", err);
+    });
+
+  // Log a one-time market clock snapshot for debugging
+  try {
+    const clock = marketClock();
+    console.log(
+      `[server] Market clock: now=${new Date().toISOString()} isMarketOpenNow=${clock.isMarketOpenNow()}`
+    );
+  } catch (e) {
+    console.warn("[server] marketClock() failed:", e);
   }
 });
